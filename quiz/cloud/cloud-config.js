@@ -3,7 +3,7 @@
  * Public on GitHub Pages (personal study only).
  */
 window.STUDY_CLOUD = {
-  MASTER_CODE: "Namcong9@",
+  MASTER_CODE: "TanTran@2004",
   DATABASE_URL:
     "postgresql://neondb_owner:npg_FbhBZ6kQqL9P@ep-frosty-fire-auhn11sa-pooler.c-10.us-east-1.aws.neon.tech/neondb?sslmode=require",
 };
