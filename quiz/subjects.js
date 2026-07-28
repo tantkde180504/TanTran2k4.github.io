@@ -1,0 +1,98 @@
+/**
+ * Unified Quiz Hub — subject registry
+ * task = “bài/đề” (generalized from PRM exam filter)
+ */
+window.QUIZ_SUBJECTS = {
+  prm: {
+    id: "prm",
+    title: "PRM393",
+    subtitle: "Flutter · SP26 · Slides",
+    brandIcon: "fa-mobile-screen-button",
+    storageWrong: "uq-prm-wrong-v1",
+    storageProgress: "uq-prm-progress-v1",
+    cloudSubject: "prm",
+    multiSelect: true,
+    showTranslationAlways: true,
+    // Chỉ hiện tab khi có câu (app ẩn count=0)
+    tasks: [
+      { id: "fe", label: "SP26 FE", icon: "fa-file" },
+      { id: "re", label: "SP26 B5 FE", icon: "fa-file-circle-plus" },
+      { id: "fuexam", label: "Đề FE", icon: "fa-file-circle-check" },
+      { id: "slides", label: "Slides", icon: "fa-chalkboard" },
+      { id: "all", label: "Tất cả", icon: "fa-layer-group" },
+    ],
+    defaultTask: "all",
+    dataKey: "prm",
+    hint: "Chọn đề SP26 / Slides (tab 0 câu sẽ ẩn). Giải thích song ngữ EN–VI.",
+  },
+  mln: {
+    id: "mln",
+    title: "MLN",
+    subtitle: "Bank 526 · Đề FE",
+    brandIcon: "fa-book-open",
+    storageWrong: "uq-mln-wrong-v1",
+    storageProgress: "uq-mln-progress-v1",
+    cloudSubject: "mln",
+    multiSelect: true,
+    showTranslationAlways: false,
+    hideTranslation: true,
+    tasks: [
+      { id: "bank", label: "Bank 526", icon: "fa-book" },
+      { id: "fuexam", label: "Đề FE (bổ sung)", icon: "fa-file-circle-plus" },
+      { id: "all", label: "Tất cả", icon: "fa-layer-group" },
+    ],
+    defaultTask: "all",
+    dataKey: "mln",
+    hint: "Bank MLN + bộ Đề FE bổ sung từ remote. Multi-select khi đáp án nhiều chữ.",
+  },
+  jit: {
+    id: "jit",
+    title: "JIT401",
+    subtitle: "Quiz · Sample · PT · Slides · Site",
+    brandIcon: "fa-laptop-code",
+    storageWrong: "uq-jit-wrong-v1",
+    storageProgress: "uq-jit-progress-v1",
+    cloudSubject: "jit",
+    multiSelect: false,
+    showTranslationAlways: true,
+    tasks: [
+      { id: "quiz", label: "Quiz", icon: "fa-list-check" },
+      { id: "sample", label: "Sample", icon: "fa-flask" },
+      { id: "pt", label: "Quiz PT", icon: "fa-pen-to-square" },
+      { id: "fuexam", label: "Đề FE", icon: "fa-file-circle-check" },
+      { id: "slides", label: "Slides (bổ sung)", icon: "fa-chalkboard" },
+      { id: "site", label: "Site (bổ sung)", icon: "fa-globe" },
+      { id: "albazzz", label: "Albazzz", icon: "fa-book" },
+      { id: "all", label: "Tất cả", icon: "fa-layer-group" },
+    ],
+    defaultTask: "all",
+    dataKey: "jit",
+    hint: "Quiz / Sample / PT + Slides + Site (MLN122). Tab 0 câu sẽ ẩn. JP + bảng dịch VI.",
+  },
+  // dataKey vẫn "fe" (file data/fe.js); hiển thị JFE — URL ?s=fe hoặc ?s=jfe
+  fe: {
+    id: "fe",
+    title: "JFE301",
+    subtitle: "Test · 300 · Books · Đề FE",
+    brandIcon: "fa-graduation-cap",
+    storageWrong: "uq-fe-wrong-v1",
+    storageProgress: "uq-fe-progress-v1",
+    cloudSubject: "fe",
+    multiSelect: false,
+    showTranslationAlways: true,
+    tasks: [
+      { id: "test", label: "Test", icon: "fa-vial" },
+      { id: "bank300", label: "300 câu", icon: "fa-database" },
+      { id: "datajfe", label: "datajfe", icon: "fa-file-image" },
+      { id: "albazzz", label: "Albazzz", icon: "fa-book" },
+      { id: "books", label: "Books (bổ sung)", icon: "fa-book-open" },
+      { id: "fuexam", label: "Đề FE (bổ sung)", icon: "fa-file-circle-plus" },
+      { id: "all", label: "Tất cả", icon: "fa-layer-group" },
+    ],
+    defaultTask: "all",
+    dataKey: "fe",
+    hint: "JFE301: test · 300 · datajfe + Books/Đề FE. Tab 0 câu được ẩn.",
+  },
+};
+
+window.QUIZ_SUBJECT_ORDER = ["prm", "mln", "jit", "fe"];

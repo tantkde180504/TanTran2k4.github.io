@@ -1,0 +1,3007 @@
+/**
+ * Unified Quiz Hub — multi-subject engine (PRM base)
+ * Subjects: prm | mln | jit | fe  ·  task filter per subject
+ */
+(function () {
+  "use strict";
+
+  function qsParam(name) {
+    try {
+      return new URLSearchParams(location.search).get(name);
+    } catch {
+      return null;
+    }
+  }
+
+  const SUBJECTS = window.QUIZ_SUBJECTS || {};
+  const ORDER = window.QUIZ_SUBJECT_ORDER || Object.keys(SUBJECTS);
+  let subjectId = (qsParam("s") || qsParam("subject") || "prm").toLowerCase();
+  // Alias hiển thị: JFE301 (data vẫn key "fe")
+  if (subjectId === "jfe" || subjectId === "jfe301" || subjectId === "wedjfe") subjectId = "fe";
+  if (!SUBJECTS[subjectId]) subjectId = ORDER[0] || "prm";
+  const CFG = SUBJECTS[subjectId] || {
+    id: subjectId,
+    title: subjectId,
+    storageWrong: "uq-" + subjectId + "-wrong-v1",
+    storageProgress: "uq-" + subjectId + "-progress-v1",
+    cloudSubject: subjectId,
+    multiSelect: true,
+    tasks: [{ id: "all", label: "Tất cả" }],
+    defaultTask: "all",
+    dataKey: subjectId,
+  };
+
+  const STORAGE_KEY = CFG.storageWrong;
+  const PROGRESS_KEY = CFG.storageProgress;
+  /** Điểm/đã làm — key riêng, luôn ghi local (kể cả cloud) để F5 không mất */
+  const SCORE_KEY = String(PROGRESS_KEY || "uq-" + subjectId + "-progress-v1").replace(
+    /progress/i,
+    "score"
+  );
+  /**
+   * Danh sách id câu ĐÚNG — cùng pattern wrongIds (đã chứng minh sống sót F5/cloud).
+   * uq-*-wrong-v1 → uq-*-correct-v1
+   */
+  const CORRECT_KEY = String(STORAGE_KEY || "uq-" + subjectId + "-wrong-v1").replace(
+    /wrong/i,
+    "correct"
+  );
+  const CLOUD_SUBJECT = CFG.cloudSubject || subjectId;
+  const CLOUD_SUBJECT_ALT = subjectId;
+  const LEGACY_STORAGE_KEYS = [];
+  const LEGACY_PROGRESS_KEYS = [];
+
+  /** @type {Array} */
+  const DATA_MAP = window.QUIZ_DATA || {};
+  const BANK = Array.isArray(DATA_MAP[CFG.dataKey])
+    ? DATA_MAP[CFG.dataKey]
+    : Array.isArray(window.QUIZ_QUESTIONS)
+      ? window.QUIZ_QUESTIONS
+      : [];
+
+  const TASK_DEFS = Array.isArray(CFG.tasks) ? CFG.tasks : [{ id: "all", label: "Tất cả" }];
+  const TASK_IDS = new Set(TASK_DEFS.map((t) => t.id));
+
+// —— State ——
+  let mode = "all"; // 'all' | 'wrong'
+  /** active task id; "all" = every task */
+  let examSet = CFG.defaultTask || "all";
+  let queue = [];
+  let index = 0;
+  let answered = false;
+  /** @type {string[]} pending multi-select or single choice before submit */
+  let selectedLetters = [];
+  let sessionCorrect = 0;
+  let sessionAnswered = 0;
+  /** @type {Set<number>} */
+  let wrongIds = new Set();
+  /** @type {Set<number>} id câu đã trả lời đúng (nguồn điểm bền) */
+  let correctIds = new Set();
+  /**
+   * lastChoice: id -> string[] of chosen letters
+   * @type {Map<number, string[]>}
+   */
+  let lastChoice = new Map();
+  let searchQuery = "";
+  /** User preference: show explanation panel after answering (default true) */
+  let explainVisible = true;
+  /**
+   * Pending restore after cloud/local load
+   * @type {{ currentId: number|null, mode: string, shuffle?: boolean, explainVisible?: boolean|null, examSet?: string }|null}
+   */
+  let pendingRestore = null;
+
+  function normalizeExamSet(v) {
+    if (v == null || v === "" || v === "both") return "all";
+    const s = String(v);
+    if (TASK_IDS.has(s)) return s;
+    if (s === "fe" || s === "re") return s;
+    return CFG.defaultTask || "all";
+  }
+
+  /** Active pool for current exam selection (before wrong-mode filter) */
+  function examPool() {
+    if (examSet === "all" || examSet === "both") return BANK.slice();
+    // MLN bank: legacy questions use task "all" (not the filter id "all")
+    if (examSet === "bank") {
+      return BANK.filter((q) => {
+        const t = String(q.task || q.exam || "all");
+        return t === "all" || t === "bank" || t === "bank_526";
+      });
+    }
+    return BANK.filter((q) => String(q.task || q.exam || "all") === examSet);
+  }
+
+  /** true khi đang lọc theo 1 task/tag cụ thể (không phải «Tất cả»). */
+  function isScopedExam() {
+    return examSet !== "all" && examSet !== "both";
+  }
+
+  function currentExamLabel() {
+    if (!isScopedExam()) return "Tất cả";
+    const def = TASK_DEFS.find((t) => t.id === examSet);
+    return (def && def.label) || examSet;
+  }
+
+  /** Set id số thuộc pool tag đang chọn. */
+  function examPoolIdSet() {
+    const set = new Set();
+    examPool().forEach((q) => {
+      const id = Number(q.id);
+      if (Number.isFinite(id)) set.add(id);
+    });
+    return set;
+  }
+
+  function wrongIdsInExamPool() {
+    const scope = examPoolIdSet();
+    return [...wrongIds].filter((id) => scope.has(Number(id)));
+  }
+
+  function correctIdsInExamPool() {
+    const scope = examPoolIdSet();
+    return [...correctIds].filter((id) => scope.has(Number(id)));
+  }
+
+  /**
+   * Điểm / đã làm / sai theo tag đang học (examSet).
+   * Storage vẫn toàn môn; chỉ UI + reset/xóa bám scope này.
+   *
+   * % = đúng / đã làm trong tag — KHÔNG chia tổng bank hay độ dài hàng đợi.
+   * «đã làm» = câu có lastChoice trong tag ∪ correctIds trong tag.
+   * Wrong-bank chỉ bổ sung «đã làm» khi tag chưa có lastChoice (restore cũ).
+   */
+  function examScoreStats() {
+    const scope = examPoolIdSet();
+    /** @type {Set<number>} */
+    const answeredIds = new Set();
+
+    let correct = 0;
+    correctIds.forEach((id) => {
+      const nid = Number(id);
+      if (!scope.has(nid)) return;
+      correct += 1;
+      answeredIds.add(nid);
+    });
+
+    let wrong = 0;
+    wrongIds.forEach((id) => {
+      const nid = Number(id);
+      if (scope.has(nid)) wrong += 1;
+    });
+
+    let anyChoiceInScope = false;
+    lastChoice.forEach((chosen, id) => {
+      const nid = Number(id);
+      if (!scope.has(nid) || !chosen || !chosen.length) return;
+      anyChoiceInScope = true;
+      answeredIds.add(nid);
+    });
+
+    // Restore cũ: chưa có map đáp án trong tag → ước lượng đã làm từ wrong-bank
+    if (!anyChoiceInScope) {
+      wrongIds.forEach((id) => {
+        const nid = Number(id);
+        if (scope.has(nid)) answeredIds.add(nid);
+      });
+    }
+
+    const answered = Math.max(answeredIds.size, correct);
+    return {
+      correct,
+      wrong,
+      answered,
+      // Cùng công thức: điểm% = đúng / đã làm (tag)
+      pctNum: correct,
+      pctDen: answered,
+      total: scope.size,
+      label: currentExamLabel(),
+      scoped: isScopedExam(),
+    };
+  }
+
+  /** Cập nhật title nút Reset/Xóa sai + badge điểm theo tag đang chọn. */
+  function updateScopeActionTitles() {
+    const label = currentExamLabel();
+    const scoped = isScopedExam();
+    const scopeHint = scoped ? `tag «${label}»` : "toàn bộ môn";
+    if (el.btnResetSession) {
+      el.btnResetSession.title = scoped
+        ? `Reset điểm tag «${label}» (không đụng tag khác)`
+        : "Reset điểm toàn bộ môn (mọi tag)";
+    }
+    if (el.btnClearWrong) {
+      el.btnClearWrong.title = scoped
+        ? `Xóa câu sai trong tag «${label}» (không đụng tag khác)`
+        : "Xóa câu sai đã lưu (toàn bộ môn)";
+    }
+    const bar = document.getElementById("statsBar");
+    if (bar) {
+      const ans = bar.querySelector(".badge-answered");
+      const done = bar.querySelector(".badge-done");
+      const score = bar.querySelector(".badge-score:not(.badge-done)");
+      const wrong = bar.querySelector(".badge-wrong");
+      if (ans) ans.title = `Số câu đã trả lời · ${scopeHint}`;
+      if (done) done.title = `Số câu đúng đã lưu · ${scopeHint}`;
+      if (score) score.title = `Điểm = số câu đúng (1đ/câu) · ${scopeHint}`;
+      if (wrong) wrong.title = `Câu sai đã lưu (ôn lại) · ${scopeHint}`;
+    }
+  }
+
+  function questionTag(q) {
+    if (!q) return "";
+    const lab =
+      q.taskLabel ||
+      q.examLabel ||
+      (TASK_DEFS.find((t) => t.id === (q.task || q.exam)) || {}).label ||
+      "";
+    const n = q.num != null ? q.num : q.id;
+    return lab ? `${lab} #${n}` : `#${q.id}`;
+  }
+
+  // —— DOM ——
+  const $ = (sel) => document.querySelector(sel);
+  const el = {
+    qIndex: $("#qIndex"),
+    qId: $("#qId"),
+    questionText: $("#questionText"),
+    questionFigure: $("#questionFigure"),
+    questionImage: $("#questionImage"),
+    questionImageCap: $("#questionImageCap"),
+    multiHint: $("#multiHint"),
+    options: $("#options"),
+    submitRow: $("#submitRow"),
+    btnSubmit: $("#btnSubmit"),
+    submitCount: $("#submitCount"),
+    feedback: $("#feedback"),
+    explainPanel: $("#explainPanel"),
+    explainToggleRow: $("#explainToggleRow"),
+    btnToggleExplain: $("#btnToggleExplain"),
+    toggleExplainLabel: $("#toggleExplainLabel"),
+    toggleExplainIcon: $("#toggleExplainIcon"),
+    altPanel: $("#altPanel"),
+    quizCard: $("#quizCard"),
+    emptyState: $("#emptyState"),
+    emptyTitle: $("#emptyTitle"),
+    emptyDesc: $("#emptyDesc"),
+    btnPrev: $("#btnPrev"),
+    btnNext: $("#btnNext"),
+    btnJump: $("#btnJump"),
+    jumpInput: $("#jumpInput"),
+    progressBar: $("#progressBar"),
+    statCorrect: $("#statCorrect"),
+    statWrong: $("#statWrong"),
+    statProgress: $("#statProgress"),
+    statTotal: $("#statTotal"),
+    statAnswered: $("#statAnswered"),
+    statScore: $("#statScore"),
+    statPct: $("#statPct"),
+    badgeAll: $("#badgeAll"),
+    badgeWrong: $("#badgeWrong"),
+    badgeExamFe: $("#badgeExamFe"),
+    badgeExamRe: $("#badgeExamRe"),
+    badgeExamBoth: $("#badgeExamBoth"),
+    shuffleToggle: $("#shuffleToggle"),
+    btnReshuffle: $("#btnReshuffle"),
+    btnResetSession: $("#btnResetSession"),
+    btnClearWrong: $("#btnClearWrong"),
+    btnGoAll: $("#btnGoAll"),
+    searchInput: $("#searchInput"),
+    searchResults: $("#searchResults"),
+    btnClearSearch: $("#btnClearSearch"),
+    statsBar: $("#statsBar"),
+    syncBadge: $("#syncBadge"),
+    syncBadgeIcon: $("#syncBadgeIcon"),
+    syncBadgeText: $("#syncBadgeText"),
+    masterModal: $("#masterModal"),
+    masterCodeInput: $("#masterCodeInput"),
+    masterError: $("#masterError"),
+    masterStatus: $("#masterStatus"),
+    masterLogin: $("#masterLogin"),
+    masterSkip: $("#masterSkip"),
+    masterLogout: $("#masterLogout"),
+    sideMap: $("#sideMap"),
+    qMap: $("#qMap"),
+    mapCount: $("#mapCount"),
+    btnToggleMap: $("#btnToggleMap"),
+    mapToggleLabel: $("#mapToggleLabel"),
+    mapToggleIcon: $("#mapToggleIcon"),
+  };
+
+  const MAP_VIS_KEY = "uq-map-visible-v1";
+  let mapVisible = true;
+  try {
+    const v = localStorage.getItem(MAP_VIS_KEY);
+    if (v === "0") mapVisible = false;
+  } catch {
+    /* ignore */
+  }
+
+  // —— Explain overrides (local customize, not wiped by rebuild until applied) ——
+  const EXPLAIN_OVR_KEY = "uq-" + subjectId + "-explain-override-v1";
+  /** @type {Record<string, object>} id -> partial explanation */
+  let explainOverrides = {};
+  try {
+    const raw = localStorage.getItem(EXPLAIN_OVR_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && typeof p === "object") explainOverrides = p;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  function saveExplainOverrides() {
+    try {
+      localStorage.setItem(EXPLAIN_OVR_KEY, JSON.stringify(explainOverrides));
+    } catch {
+      /* ignore quota */
+    }
+  }
+
+  // —— Explain panel field visibility (user prefs, not content edit) ——
+  const EXPLAIN_VIS_KEY = "uq-explain-fields-vis-v1";
+  const EXPLAIN_VIS_DEFAULT = {
+    translation: true, // bảng dịch đề + options
+    answer: true, // đáp án
+    intent: true, // ý chính
+    concept: true, // đây là gì?
+    whyCorrect: true, // vì sao đúng?
+    memoryTip: true, // mẹo nhớ
+    whyWrong: true, // các đáp án còn lại
+    multiKeys: true, // multi-select: list đáp án đúng
+  };
+  /** @type {typeof EXPLAIN_VIS_DEFAULT} */
+  let explainVis = { ...EXPLAIN_VIS_DEFAULT };
+  try {
+    const raw = localStorage.getItem(EXPLAIN_VIS_KEY);
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && typeof p === "object") {
+        for (const k of Object.keys(EXPLAIN_VIS_DEFAULT)) {
+          if (typeof p[k] === "boolean") explainVis[k] = p[k];
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  function saveExplainVis() {
+    try {
+      localStorage.setItem(EXPLAIN_VIS_KEY, JSON.stringify(explainVis));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function explainFieldOn(key) {
+    return explainVis[key] !== false;
+  }
+
+  function deepMergeExplain(base, ovr) {
+    const b = base && typeof base === "object" ? { ...base } : {};
+    if (!ovr || typeof ovr !== "object") return b;
+    for (const [k, v] of Object.entries(ovr)) {
+      if (v == null) continue;
+      if (
+        (k === "optionsVi" || k === "whyWrong" || k === "whatIs") &&
+        typeof v === "object" &&
+        !Array.isArray(v)
+      ) {
+        b[k] = { ...(b[k] || {}), ...v };
+      } else {
+        b[k] = v;
+      }
+    }
+    return b;
+  }
+
+  function effectiveExplanation(q) {
+    if (!q) return {};
+    const base = q.explanation && typeof q.explanation === "object" ? q.explanation : {};
+    const ovr = explainOverrides[String(q.id)];
+    return deepMergeExplain(base, ovr);
+  }
+
+  function hasExplainOverride(q) {
+    return !!(q && explainOverrides[String(q.id)]);
+  }
+
+  function correctLetters(q) {
+    if (!q) return [];
+    if (Array.isArray(q.answers) && q.answers.length) {
+      return q.answers
+        .map((a) => String(a).toUpperCase().replace(/[^A-E]/g, ""))
+        .filter(Boolean)
+        .sort();
+    }
+    if (q.answer == null || q.answer === "") return [];
+    // Multi-select may be stored as "ABC" (not only ["A","B","C"])
+    const s = String(q.answer)
+      .toUpperCase()
+      .replace(/[^A-E]/g, "");
+    if (!s) return [];
+    if (s.length === 1) return [s];
+    return s.split("").sort();
+  }
+
+  function isMulti(q) {
+    if (CFG.multiSelect === false) return false;
+    return correctLetters(q).length > 1;
+  }
+
+  function setsEqual(a, b) {
+    if (a.length !== b.length) return false;
+    const sa = a.slice().sort().join(",");
+    const sb = b.slice().sort().join(",");
+    return sa === sb;
+  }
+
+  function isCorrectSelection(q, chosen) {
+    return setsEqual(correctLetters(q), chosen || []);
+  }
+
+  // —— Storage: local vs StudyCloud (Neon) ——
+  // Cloud payload includes wrongIds + progress.currentId + lastChoices (đã trả lời).
+  function parseWrongIdsRaw(raw) {
+    if (!raw) return null;
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return null;
+      return new Set(arr.map(Number).filter((n) => Number.isFinite(n)));
+    } catch {
+      return null;
+    }
+  }
+
+  function parseProgressRaw(raw) {
+    if (!raw) return null;
+    try {
+      const p = JSON.parse(raw);
+      if (!p || typeof p !== "object") return null;
+      const id = Number(p.currentId);
+      let idx = Number(p.index);
+      if (!Number.isFinite(idx) && p.display != null) idx = Number(p.display) - 1;
+      const stats = extractStatsFromPayload(p);
+      return {
+        currentId: Number.isFinite(id) ? id : null,
+        index: Number.isFinite(idx) && idx >= 0 ? idx : null,
+        mode: p.mode === "wrong" ? "wrong" : "all",
+        shuffle: !!p.shuffle,
+        explainVisible:
+          typeof p.explainVisible === "boolean" ? p.explainVisible : null,
+        examSet: normalizeExamSet(p.examSet),
+        lastChoices:
+          p.lastChoices && typeof p.lastChoices === "object"
+            ? p.lastChoices
+            : null,
+        stats,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function loadWrongIdsLocal() {
+    try {
+      let set = parseWrongIdsRaw(localStorage.getItem(STORAGE_KEY));
+      if (set && set.size) return set;
+      for (const k of LEGACY_STORAGE_KEYS) {
+        set = parseWrongIdsRaw(localStorage.getItem(k));
+        if (set && set.size) {
+          // migrate → key mới
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify([...set]));
+          } catch {
+            /* ignore */
+          }
+          return set;
+        }
+      }
+      return set || new Set();
+    } catch {
+      return new Set();
+    }
+  }
+
+  function saveWrongIdsLocal() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify([...wrongIds]));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function loadCorrectIdsLocal() {
+    try {
+      const set = parseWrongIdsRaw(localStorage.getItem(CORRECT_KEY));
+      return set || new Set();
+    } catch {
+      return new Set();
+    }
+  }
+
+  function saveCorrectIdsLocal() {
+    try {
+      localStorage.setItem(CORRECT_KEY, JSON.stringify([...correctIds]));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Đồng bộ sessionCorrect/Answered từ correctIds + lastChoice (nguồn bền). */
+  function syncScoreFromSets() {
+    // Bổ sung correctIds từ lastChoice nếu map còn (migrate dữ liệu cũ)
+    lastChoice.forEach((chosen, id) => {
+      const q = BANK.find((x) => Number(x.id) === Number(id));
+      if (!q || !chosen || !chosen.length) return;
+      if (isCorrectSelection(q, chosen)) correctIds.add(Number(id));
+      else correctIds.delete(Number(id));
+    });
+    sessionCorrect = correctIds.size;
+    sessionAnswered = Math.max(lastChoice.size, sessionCorrect + countAnsweredWrongOnly());
+    // answered ≥ correct; nếu lastChoice rỗng nhưng có correctIds thì dùng correct + wrong đã làm
+    if (lastChoice.size === 0 && (correctIds.size || wrongIds.size)) {
+      // Ước lượng đã làm: mọi id đúng ∪ sai đã từng chạm (overlap có thể)
+      const union = new Set([...correctIds, ...wrongIds]);
+      sessionAnswered = Math.max(sessionAnswered, union.size, correctIds.size);
+    }
+    if (sessionCorrect > sessionAnswered) sessionAnswered = sessionCorrect;
+    saveScoreLocal();
+  }
+
+  /** Số câu trong wrongIds không còn trong correctIds (đã sai và chưa làm đúng lại). */
+  function countAnsweredWrongOnly() {
+    let n = 0;
+    wrongIds.forEach((id) => {
+      if (!correctIds.has(Number(id))) n += 1;
+    });
+    return n;
+  }
+
+  function lastChoicesToObject() {
+    const o = {};
+    lastChoice.forEach((letters, id) => {
+      if (Array.isArray(letters) && letters.length) o[String(id)] = letters.slice();
+    });
+    return o;
+  }
+
+  /** Gộp nhiều map lastChoices (map sau ghi đè map trước khi trùng id). */
+  function mergeChoiceMaps() {
+    const out = {};
+    for (let i = 0; i < arguments.length; i++) {
+      const obj = arguments[i];
+      if (!obj || typeof obj !== "object") continue;
+      Object.keys(obj).forEach((k) => {
+        const letters = obj[k];
+        if (!Array.isArray(letters) || !letters.length) return;
+        const id = Number(k);
+        if (!Number.isFinite(id)) return;
+        out[String(id)] = letters.map(String).map((L) => L.toUpperCase());
+      });
+    }
+    return out;
+  }
+
+  function extractChoicesFromPayload(data) {
+    if (!data || typeof data !== "object") return {};
+    const prog = data.progress || {};
+    return mergeChoiceMaps(prog.lastChoices, data.lastChoices);
+  }
+
+  function extractStatsFromPayload(data) {
+    if (!data || typeof data !== "object") return null;
+    const st = data.stats || (data.progress && data.progress.stats) || null;
+    if (!st || typeof st !== "object") return null;
+    const a = Number(st.sessionAnswered);
+    const c = Number(st.sessionCorrect);
+    if (!Number.isFinite(a) && !Number.isFinite(c)) return null;
+    return {
+      sessionAnswered: Number.isFinite(a) ? Math.max(0, a) : 0,
+      sessionCorrect: Number.isFinite(c) ? Math.max(0, c) : 0,
+    };
+  }
+
+  /**
+   * Khôi phục điểm: ưu tiên đếm lại từ lastChoice; nếu thiếu map
+   * (cloud cũ chỉ có wrongIds) thì lấy max với stats đã lưu — tránh về 0 oan.
+   */
+  function applyStatsFallback(stats) {
+    if (!stats) return;
+    const a = Number(stats.sessionAnswered);
+    const c = Number(stats.sessionCorrect);
+    if (Number.isFinite(a) && a > sessionAnswered) sessionAnswered = a;
+    if (Number.isFinite(c) && c > sessionCorrect) sessionCorrect = c;
+    // Đúng không vượt quá đã làm
+    if (sessionCorrect > sessionAnswered) sessionAnswered = sessionCorrect;
+  }
+
+  function loadScoreLocal() {
+    try {
+      const raw = localStorage.getItem(SCORE_KEY);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (!o || typeof o !== "object") return null;
+      const a = Number(o.sessionAnswered);
+      const c = Number(o.sessionCorrect);
+      const ids = Array.isArray(o.correctIds)
+        ? o.correctIds.map(Number).filter((n) => Number.isFinite(n))
+        : null;
+      if (!Number.isFinite(a) && !Number.isFinite(c) && !ids) return null;
+      return {
+        sessionAnswered: Number.isFinite(a) ? Math.max(0, a) : 0,
+        sessionCorrect: Number.isFinite(c)
+          ? Math.max(0, c)
+          : ids
+            ? ids.length
+            : 0,
+        correctIds: ids,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function saveScoreLocal() {
+    try {
+      localStorage.setItem(
+        SCORE_KEY,
+        JSON.stringify({
+          sessionCorrect: correctIds.size || sessionCorrect,
+          sessionAnswered,
+          correctIds: [...correctIds],
+          savedAt: Date.now(),
+        })
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function applyCorrectIdsArray(arr) {
+    if (!Array.isArray(arr)) return;
+    arr.forEach((id) => {
+      const n = Number(id);
+      if (Number.isFinite(n)) correctIds.add(n);
+    });
+  }
+
+  function applyLastChoicesObject(obj) {
+    if (!obj || typeof obj !== "object") return;
+    Object.keys(obj).forEach((k) => {
+      const id = Number(k);
+      const letters = obj[k];
+      if (!Number.isFinite(id) || !Array.isArray(letters) || !letters.length) return;
+      lastChoice.set(
+        id,
+        letters.map(String).map((L) => L.toUpperCase())
+      );
+    });
+    recomputeSessionStatsFromChoices();
+  }
+
+  function loadProgressLocal() {
+    try {
+      let p = parseProgressRaw(localStorage.getItem(PROGRESS_KEY));
+      if (p && (p.currentId != null || p.index != null || p.lastChoices || p.stats)) return p;
+      for (const k of LEGACY_PROGRESS_KEYS) {
+        p = parseProgressRaw(localStorage.getItem(k));
+        if (p && (p.currentId != null || p.index != null || p.lastChoices || p.stats)) {
+          try {
+            localStorage.setItem(PROGRESS_KEY, localStorage.getItem(k));
+          } catch {
+            /* ignore */
+          }
+          return p;
+        }
+      }
+      return p;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveProgressLocal() {
+    try {
+      const cur = queue[index];
+      const choices = lastChoicesToObject();
+      const stats = {
+        sessionCorrect,
+        sessionAnswered,
+      };
+      localStorage.setItem(
+        PROGRESS_KEY,
+        JSON.stringify({
+          currentId: cur ? cur.id : null,
+          index: index,
+          display: index + 1,
+          mode,
+          shuffle: !!(el.shuffleToggle && el.shuffleToggle.checked),
+          explainVisible,
+          examSet,
+          lastChoices: choices,
+          stats,
+        })
+      );
+      // Luôn mirror điểm ra key riêng (kể cả khi cloud mode)
+      saveScoreLocal();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function applyUiMode(newMode) {
+    mode = newMode === "wrong" ? "wrong" : "all";
+    document.querySelectorAll(".tab[data-tab]").forEach((t) => {
+      const active = t.dataset.tab === mode;
+      t.classList.toggle("active", active);
+      t.setAttribute("aria-selected", active ? "true" : "false");
+    });
+  }
+
+  function applyExamUi() {
+    document.querySelectorAll(".exam-tab[data-exam]").forEach((t) => {
+      const active = t.dataset.exam === examSet;
+      t.classList.toggle("active", active);
+      t.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    updateExamBadges();
+    updateScopeActionTitles();
+  }
+
+  function countForTask(tid) {
+    if (tid === "all") return BANK.length;
+    if (tid === "bank") {
+      return BANK.filter((q) => {
+        const t = String(q.task || q.exam || "all");
+        return t === "all" || t === "bank" || t === "bank_526";
+      }).length;
+    }
+    return BANK.filter((q) => String(q.task || q.exam) === tid).length;
+  }
+
+  function updateExamBadges() {
+    document.querySelectorAll("[data-task-count]").forEach((node) => {
+      const tid = node.getAttribute("data-task-count");
+      const n = countForTask(tid);
+      node.textContent = String(n);
+      // Ẩn tab Bài/đề khi 0 câu (Albazzz, Đề FE… nếu không có data)
+      const btn = node.closest(".exam-tab");
+      if (btn && tid !== "all") {
+        btn.classList.toggle("hidden", n === 0);
+        btn.hidden = n === 0;
+        if (n === 0) btn.setAttribute("aria-hidden", "true");
+        else btn.removeAttribute("aria-hidden");
+      }
+    });
+  }
+
+  function setExamSet(next, opts) {
+    const v = normalizeExamSet(next);
+    if (v === examSet && !(opts && opts.force)) return;
+    examSet = v;
+    applyExamUi();
+    // Đổi đề → build lại queue (về câu 1 trừ khi force keep id)
+    const keep =
+      opts && opts.keepPositionId != null ? opts.keepPositionId : null;
+    rebuildQueue(keep);
+    persistState({ immediate: true });
+  }
+
+  /** Parse cloud/local progress blob into pendingRestore */
+  function setPendingFromPayload(data) {
+    if (!data || typeof data !== "object") {
+      pendingRestore = null;
+      return;
+    }
+    const prog = data.progress || {};
+    const id = Number(prog.currentId != null ? prog.currentId : data.currentId);
+    // index = 0-based trong queue; display = 1-based (Câu N)
+    let idx = Number(prog.index);
+    if (!Number.isFinite(idx) && prog.display != null) {
+      idx = Number(prog.display) - 1;
+    }
+    if (!Number.isFinite(idx) && data.currentIndex != null) {
+      idx = Number(data.currentIndex);
+    }
+    const shufflePref =
+      data.prefs && typeof data.prefs.shuffle === "boolean"
+        ? data.prefs.shuffle
+        : !!prog.shuffle;
+    const examFrom =
+      (data.prefs && data.prefs.examSet) ||
+      prog.examSet ||
+      data.examSet;
+    pendingRestore = {
+      currentId: Number.isFinite(id) ? id : null,
+      index: Number.isFinite(idx) && idx >= 0 ? idx : null,
+      mode: prog.mode === "wrong" || data.mode === "wrong" ? "wrong" : "all",
+      shuffle: shufflePref,
+      examSet: normalizeExamSet(examFrom),
+      lastChoices: extractChoicesFromPayload(data),
+      stats: extractStatsFromPayload(data),
+    };
+  }
+
+  function hasUsefulProgress(data) {
+    if (!data || typeof data !== "object") return false;
+    if (Array.isArray(data.wrongIds) && data.wrongIds.length) return true;
+    const prog = data.progress || {};
+    if (prog.currentId != null || prog.index != null || prog.display != null)
+      return true;
+    if (prog.lastChoices && Object.keys(prog.lastChoices).length) return true;
+    if (data.lastChoices && Object.keys(data.lastChoices).length) return true;
+    if (data.stats && (data.stats.sessionAnswered || data.stats.sessionCorrect))
+      return true;
+    return false;
+  }
+
+  function applyPrmCloudData(data) {
+    // Giữ điểm đang có trong RAM (trước khi cloud ghi đè)
+    const memChoices = lastChoicesToObject();
+    const memCorrect = [...correctIds];
+    const memStats = {
+      sessionCorrect,
+      sessionAnswered,
+    };
+    const localProg = loadProgressLocal();
+    const localWrong = loadWrongIdsLocal();
+    const localCorrect = loadCorrectIdsLocal();
+    const localScore = loadScoreLocal();
+    const localChoices = mergeChoiceMaps(
+      extractChoicesFromPayload(localProg),
+      localProg && localProg.lastChoices,
+      memChoices
+    );
+    const localStatsBundle = [
+      memStats,
+      localScore,
+      localProg && localProg.stats,
+      extractStatsFromPayload(localProg),
+    ];
+
+    // Luôn union correctIds từ mọi nguồn bền (như wrongIds)
+    correctIds = new Set(
+      [...localCorrect, ...memCorrect]
+        .map(Number)
+        .filter((n) => Number.isFinite(n))
+    );
+    if (localScore && Array.isArray(localScore.correctIds)) {
+      applyCorrectIdsArray(localScore.correctIds);
+    }
+
+    if (data == null) {
+      wrongIds = localWrong;
+      pendingRestore = localProg;
+      if (pendingRestore && typeof pendingRestore.explainVisible === "boolean") {
+        explainVisible = pendingRestore.explainVisible;
+      }
+      if (pendingRestore && pendingRestore.examSet) {
+        examSet = normalizeExamSet(pendingRestore.examSet);
+      }
+      applyLastChoicesObject(localChoices);
+      localStatsBundle.forEach(applyStatsFallback);
+      syncScoreFromSets();
+    } else {
+      // Union wrongIds: cloud ⊔ local — không để cloud xóa câu sai local
+      const cloudWrong = Array.isArray(data.wrongIds) ? data.wrongIds : [];
+      wrongIds = new Set(
+        cloudWrong
+          .concat([...localWrong])
+          .map(Number)
+          .filter((n) => Number.isFinite(n))
+      );
+      // Union correctIds cloud ⊔ local ⊔ RAM
+      const cloudCorrect = []
+        .concat(Array.isArray(data.correctIds) ? data.correctIds : [])
+        .concat(
+          data.progress && Array.isArray(data.progress.correctIds)
+            ? data.progress.correctIds
+            : []
+        )
+        .concat(
+          data.stats && Array.isArray(data.stats.correctIds)
+            ? data.stats.correctIds
+            : []
+        );
+      applyCorrectIdsArray(cloudCorrect);
+
+      if (data.prefs && typeof data.prefs.explainVisible === "boolean") {
+        explainVisible = data.prefs.explainVisible;
+      }
+      if (data.prefs && data.prefs.examSet) {
+        examSet = normalizeExamSet(data.prefs.examSet);
+      }
+      setPendingFromPayload(data);
+
+      // Gộp lastChoices cloud + local + RAM (local/RAM ghi đè khi trùng)
+      const cloudChoices = extractChoicesFromPayload(data);
+      const mergedChoices = mergeChoiceMaps(cloudChoices, localChoices);
+      applyLastChoicesObject(mergedChoices);
+      if (pendingRestore) {
+        pendingRestore.lastChoices = mergedChoices;
+        pendingRestore.stats = {
+          sessionCorrect: correctIds.size,
+          sessionAnswered,
+        };
+      }
+
+      // Stats: max với cloud + mọi nguồn local/RAM — cloud thiếu stats không được về 0
+      applyStatsFallback(extractStatsFromPayload(data));
+      localStatsBundle.forEach(applyStatsFallback);
+      if (pendingRestore && pendingRestore.stats) {
+        applyStatsFallback(pendingRestore.stats);
+      }
+      // correctIds là nguồn điểm chính
+      syncScoreFromSets();
+
+      // Cloud gần như rỗng về vị trí → giữ cursor local
+      if (!hasUsefulProgress(data) && localProg) {
+        pendingRestore = Object.assign({}, localProg, {
+          lastChoices: mergedChoices,
+          stats: { sessionCorrect: correctIds.size, sessionAnswered },
+        });
+        if (localProg.examSet) examSet = normalizeExamSet(localProg.examSet);
+      }
+    }
+    // Mirror local ngay sau restore — F5 lần sau vẫn còn (cùng pattern wrongIds)
+    try {
+      saveWrongIdsLocal();
+      saveCorrectIdsLocal();
+      saveProgressLocal();
+      saveScoreLocal();
+    } catch {
+      /* ignore */
+    }
+    applyExamUi();
+    updateBadges();
+  }
+
+  function getPrmCloudData() {
+    const cur = queue[index];
+    const choices = lastChoicesToObject();
+    // Ép điểm từ correctIds trước khi đẩy cloud
+    sessionCorrect = correctIds.size;
+    if (sessionAnswered < sessionCorrect) sessionAnswered = sessionCorrect;
+    const stats = {
+      sessionCorrect: correctIds.size,
+      sessionAnswered,
+    };
+    return {
+      wrongIds: [...wrongIds],
+      correctIds: [...correctIds],
+      lastChoices: choices,
+      prefs: {
+        explainVisible,
+        shuffle: !!(el.shuffleToggle && el.shuffleToggle.checked),
+        examSet,
+      },
+      progress: {
+        mode,
+        examSet,
+        currentId: cur ? Number(cur.id) : null,
+        index: queue.length ? index : 0,
+        display: queue.length ? index + 1 : 1,
+        lastChoices: choices,
+        stats,
+        correctIds: [...correctIds],
+      },
+      stats,
+      savedAt: Date.now(),
+    };
+  }
+
+  /**
+   * Persist wrong bank + correctIds + vị trí + điểm.
+   * Luôn ghi localStorage (kể cả cloud) — wrongIds đã sống sót; correctIds cùng pattern.
+   * @param {{ immediate?: boolean }} [opts] immediate=true khi Next/Prev (lưu Neon ngay)
+   */
+  function persistState(opts) {
+    const immediate = !!(opts && opts.immediate);
+    sessionCorrect = correctIds.size;
+    if (sessionAnswered < sessionCorrect) sessionAnswered = sessionCorrect;
+    // Dual-write local luôn (kể cả cloud mode)
+    saveWrongIdsLocal();
+    saveCorrectIdsLocal();
+    saveProgressLocal();
+    saveScoreLocal();
+    if (window.StudyCloud && StudyCloud.isCloud()) {
+      StudyCloud.notifyChange(immediate);
+    }
+  }
+
+  function saveWrongIds() {
+    persistState({ immediate: true });
+  }
+
+  function restorePositionAndBuild() {
+    const r = pendingRestore;
+    pendingRestore = null;
+    if (!r) {
+      applyExamUi();
+      rebuildQueue(null);
+      return;
+    }
+
+    if (r.examSet) examSet = normalizeExamSet(r.examSet);
+    applyExamUi();
+
+    if (r.mode === "wrong" && wrongIds.size > 0) applyUiMode("wrong");
+    else applyUiMode("all");
+    if (typeof r.shuffle === "boolean" && el.shuffleToggle) {
+      el.shuffleToggle.checked = r.shuffle;
+    }
+    if (r.lastChoices) applyLastChoicesObject(r.lastChoices);
+    if (r.stats) applyStatsFallback(r.stats);
+    applyStatsFallback(loadScoreLocal());
+    syncReshuffleBtn();
+    updateBadges();
+
+    const shuffleOn = !!(el.shuffleToggle && el.shuffleToggle.checked);
+    // Ưu tiên: currentId (ổn định); fallback: index 0-based trong hàng đợi
+    // Nếu id không còn trong bank (đổi bộ đề), bỏ keepId để dùng index
+    let keepId =
+      r.currentId != null && Number.isFinite(Number(r.currentId))
+        ? Number(r.currentId)
+        : null;
+    if (keepId != null && !BANK.some((q) => Number(q.id) === keepId)) {
+      keepId = null;
+    }
+
+    if (keepId != null) {
+      rebuildQueue(keepId);
+      // Nếu id không còn trong queue (đổi bộ câu), fallback index
+      if (
+        (!queue[index] || Number(queue[index].id) !== keepId) &&
+        r.index != null &&
+        queue.length
+      ) {
+        index = Math.min(Math.max(0, r.index), queue.length - 1);
+        answered = false;
+        selectedLetters = [];
+        render();
+      }
+    } else if (r.index != null && !shuffleOn) {
+      rebuildQueue(null);
+      if (queue.length) {
+        index = Math.min(Math.max(0, r.index), queue.length - 1);
+        answered = false;
+        selectedLetters = [];
+        render();
+      }
+    } else {
+      rebuildQueue(null);
+    }
+
+    if (queue.length && index > 0) {
+      showToast("Tiếp tục từ câu " + (index + 1) + " / " + queue.length);
+    }
+  }
+
+  function addWrong(id) {
+    wrongIds.add(id);
+    saveWrongIds();
+    updateBadges();
+  }
+
+  function removeWrong(id) {
+    if (wrongIds.delete(id)) {
+      saveWrongIds();
+      updateBadges();
+    }
+  }
+
+  async function bootStorage() {
+    wrongIds = loadWrongIdsLocal();
+    correctIds = loadCorrectIdsLocal();
+    pendingRestore = loadProgressLocal();
+    // Khôi phục điểm sớm — correctIds (cùng pattern wrong) + score key + progress
+    const localScore = loadScoreLocal();
+    if (localScore && Array.isArray(localScore.correctIds)) {
+      applyCorrectIdsArray(localScore.correctIds);
+    }
+    applyStatsFallback(localScore);
+    if (pendingRestore && pendingRestore.stats) {
+      applyStatsFallback(pendingRestore.stats);
+    }
+    if (pendingRestore && typeof pendingRestore.explainVisible === "boolean") {
+      explainVisible = pendingRestore.explainVisible;
+    }
+    if (pendingRestore && pendingRestore.examSet) {
+      examSet = normalizeExamSet(pendingRestore.examSet);
+    }
+    if (pendingRestore && pendingRestore.lastChoices) {
+      applyLastChoicesObject(pendingRestore.lastChoices);
+    }
+    syncScoreFromSets();
+    updateBadges();
+    if (!window.StudyCloud) return;
+    // hide old modal if present
+    if (el.masterModal) {
+      el.masterModal.classList.add("hidden");
+      el.masterModal.setAttribute("hidden", "");
+    }
+    await StudyCloud.mount({
+      // "prm" = subject đã dùng trước khi rename; app vẫn đọc legacy local keys
+      subjectId: CLOUD_SUBJECT,
+      badgeParent: el.statsBar || document.querySelector(".nav-stats"),
+      getData: getPrmCloudData,
+      setData: applyPrmCloudData,
+      onAfterLoad: () => {
+        // Cloud login / restore — nhảy về câu đã lưu
+        restorePositionAndBuild();
+        // Cloud payload có thể thiếu stats — correctIds local vẫn giữ điểm
+        applyCorrectIdsArray([...(loadCorrectIdsLocal() || [])]);
+        const sc = loadScoreLocal();
+        if (sc && Array.isArray(sc.correctIds)) applyCorrectIdsArray(sc.correctIds);
+        applyStatsFallback(sc);
+        syncScoreFromSets();
+        updateBadges();
+        saveCorrectIdsLocal();
+        saveScoreLocal();
+        saveProgressLocal();
+      },
+      autoPrompt: true,
+    });
+  }
+
+  // —— Utils ——
+  /** Debug: bật/tắt log console khi điều tra shuffle / nhảy câu */
+  const DEBUG_PRM = false;
+  let _dbgRenderN = 0;
+  function dbg(tag, data) {
+    if (!DEBUG_PRM) return;
+    const cur = queue[index];
+    const base = {
+      t: Date.now(),
+      tag,
+      mode,
+      shuffleOn: !!(el.shuffleToggle && el.shuffleToggle.checked),
+      index,
+      qId: cur ? cur.id : null,
+      queueLen: queue.length,
+      first3Ids: queue.slice(0, 3).map((q) => q.id),
+      jumpInput: el.jumpInput ? el.jumpInput.value : null,
+    };
+    console.log("[PRM-DEBUG]", tag, Object.assign(base, data || {}));
+  }
+
+  function shuffle(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function getSourceList() {
+    const pool = examPool();
+    if (mode === "wrong") {
+      return pool.filter((q) => wrongIds.has(q.id));
+    }
+    return pool;
+  }
+
+  /**
+   * @param {number|null|undefined} keepPositionId
+   * @param {{ forceShuffle?: boolean }} [opts]
+   *   forceShuffle: xáo ngay (nút Xáo lại) — KHÔNG đụng tới checkbox Ngẫu nhiên
+   */
+  function rebuildQueue(keepPositionId, opts) {
+    const options = opts || {};
+    const prevIndex = index;
+    const prevId = queue[index] ? queue[index].id : null;
+    const stack = new Error().stack;
+    const shuffleOn = !!(el.shuffleToggle && el.shuffleToggle.checked);
+    // Xáo lại chỉ forceShuffle; checkbox Ngẫu nhiên chỉ do user bật/tắt
+    const didShuffle = !!(
+      (options.forceShuffle || shuffleOn) &&
+      getSourceList().length > 1
+    );
+
+    dbg("rebuildQueue:start", {
+      keepPositionId,
+      prevIndex,
+      prevId,
+      shuffleOn,
+      forceShuffle: !!options.forceShuffle,
+      didShuffle,
+      stack: stack ? stack.split("\n").slice(0, 6).join(" | ") : null,
+    });
+
+    let list = getSourceList();
+    if (didShuffle) {
+      list = shuffle(list);
+    }
+    queue = list;
+
+    if (keepPositionId != null) {
+      const want = Number(keepPositionId);
+      const found = queue.findIndex((q) => Number(q.id) === want);
+      index = found >= 0 ? found : 0;
+      dbg("rebuildQueue:keepId", {
+        keepPositionId,
+        found,
+        newIndex: index,
+        didShuffle,
+      });
+    } else {
+      index = 0;
+      dbg("rebuildQueue:resetTo0", { didShuffle, reason: "keepPositionId is null" });
+    }
+    if (index >= queue.length) index = Math.max(0, queue.length - 1);
+
+    // Không xóa lastChoice — cần giữ đáp án đã làm để mở lại vẫn hiện đúng/sai
+    answered = false;
+    selectedLetters = [];
+    dbg("rebuildQueue:beforeRender", {
+      didShuffle,
+      shuffleOn,
+      newIndex: index,
+      newId: queue[index] ? queue[index].id : null,
+    });
+    syncReshuffleBtn();
+    render();
+  }
+
+  /** Nút Xáo lại chỉ dùng khi đang bật Ngẫu nhiên — hai control tách biệt */
+  function syncReshuffleBtn() {
+    if (!el.btnReshuffle || !el.shuffleToggle) return;
+    const on = !!el.shuffleToggle.checked;
+    el.btnReshuffle.disabled = !on;
+    el.btnReshuffle.title = on
+      ? "Xáo thứ tự câu hỏi (giữ chế độ Ngẫu nhiên)"
+      : "Chỉ dùng khi đã bật Ngẫu nhiên";
+    el.btnReshuffle.setAttribute("aria-disabled", on ? "false" : "true");
+  }
+
+  function currentQuestion() {
+    return queue[index] || null;
+  }
+
+  /**
+   * Resolve image path for a question (meta.img / img / imageUrl).
+   * Relative paths are served from quiz root (e.g. imge/1.png).
+   * @param {object} q
+   * @returns {{ src: string, label: string }|null}
+   */
+  function resolveQuestionImage(q) {
+    if (!q) return null;
+    const m = q.meta || {};
+    const url = q.imageUrl || m.imageUrl || null;
+    if (url) {
+      return { src: String(url), label: String(m.imgLabel || m.caption || "") };
+    }
+    const name = q.img || m.img || m.image || null;
+    if (!name) return null;
+    const s = String(name);
+    if (/^https?:\/\//i.test(s) || s.startsWith("data:") || s.startsWith("/") || s.startsWith("./") || s.includes("/")) {
+      return { src: s, label: String(m.imgLabel || m.caption || "") };
+    }
+    const dir = String(m.imgDir || "imge").replace(/\/+$/, "");
+    return { src: dir + "/" + s, label: String(m.imgLabel || m.caption || "") };
+  }
+
+  function renderQuestionImage(q) {
+    if (!el.questionFigure || !el.questionImage) return;
+    const ref = resolveQuestionImage(q);
+    if (!ref) {
+      el.questionFigure.classList.add("hidden");
+      el.questionImage.removeAttribute("src");
+      el.questionImage.alt = "";
+      if (el.questionImageCap) el.questionImageCap.textContent = "";
+      return;
+    }
+    el.questionFigure.classList.remove("hidden");
+    el.questionImage.src = ref.src;
+    el.questionImage.alt = ref.label || "Hình minh họa đề bài";
+    if (el.questionImageCap) {
+      el.questionImageCap.textContent = ref.label || "";
+      el.questionImageCap.classList.toggle("hidden", !ref.label);
+    }
+    el.questionImage.onerror = () => {
+      el.questionFigure.classList.add("hidden");
+    };
+  }
+
+  function goToQuestionId(id) {
+    // Prefer current queue; if not found, switch to all + unshuffle + matching exam
+    let found = queue.findIndex((q) => q.id === id);
+    if (found < 0) {
+      const hit = BANK.find((q) => Number(q.id) === Number(id));
+      const hitTask = hit && (hit.task || hit.exam);
+      if (hit && hitTask && examSet !== "all" && examSet !== "both" && hitTask !== examSet) {
+        examSet = hitTask;
+        applyExamUi();
+      }
+      applyUiMode("all");
+      if (el.shuffleToggle) el.shuffleToggle.checked = false;
+      queue = examPool();
+      found = queue.findIndex((q) => q.id === id);
+    }
+    if (found < 0) return;
+    index = found;
+    answered = false;
+    selectedLetters = [];
+    hideSearchResults();
+    if (el.searchInput) el.searchInput.value = "";
+    searchQuery = "";
+    if (el.btnClearSearch) el.btnClearSearch.classList.add("hidden");
+    render();
+    persistState({ immediate: true });
+    el.quizCard?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  // —— Render ——
+  /**
+   * Đồng bộ điểm/đã làm từ lastChoice.
+   * @param {{ force?: boolean }} [opts] force=true (Reset điểm) ghi đè tuyệt đối;
+   *   mặc định không giảm điểm đã khôi phục khi map đáp án bị thiếu một phần.
+   */
+  function recomputeSessionStatsFromChoices(opts) {
+    let answered = 0;
+    let correct = 0;
+    lastChoice.forEach((chosen, id) => {
+      if (!chosen || !chosen.length) return;
+      const q = BANK.find((x) => Number(x.id) === Number(id));
+      if (!q) return;
+      answered += 1;
+      if (isCorrectSelection(q, chosen)) correct += 1;
+    });
+    if (opts && opts.force) {
+      sessionAnswered = answered;
+      sessionCorrect = correct;
+      return;
+    }
+    // Không cho điểm tụt về 0 khi cloud/local mất lastChoices nhưng stats còn
+    sessionAnswered = Math.max(sessionAnswered, answered);
+    sessionCorrect = Math.max(sessionCorrect, correct);
+    if (sessionCorrect > sessionAnswered) sessionAnswered = sessionCorrect;
+  }
+
+  function updateBadges() {
+    // Storage / cloud: session* vẫn phản ánh toàn môn (correctIds global)
+    // UI header: luôn theo tag đang học (examSet)
+    const globalCorrect = correctIds.size;
+    if (sessionCorrect < globalCorrect) sessionCorrect = globalCorrect;
+    if (sessionAnswered < sessionCorrect) sessionAnswered = sessionCorrect;
+
+    const ui = examScoreStats();
+    const poolLen = examPool().length;
+
+    el.badgeAll.textContent = String(poolLen);
+    el.badgeWrong.textContent = String(ui.wrong);
+    updateExamBadges();
+    updateScopeActionTitles();
+
+    el.statWrong.textContent = String(ui.wrong);
+    el.statCorrect.textContent = String(ui.correct);
+    if (el.statAnswered) el.statAnswered.textContent = String(ui.answered);
+    if (el.statScore) el.statScore.textContent = String(ui.correct);
+    if (el.statPct) {
+      // Tỷ lệ đúng / đã làm trong tag — không dùng tổng bank hay độ dài queue
+      const den = ui.pctDen > 0 ? ui.pctDen : ui.answered;
+      const num = ui.pctNum != null ? ui.pctNum : ui.correct;
+      if (den > 0) {
+        const p = Math.round((num / den) * 100);
+        el.statPct.textContent = `(${p}%)`;
+        el.statPct.title = `${num}/${den} đúng/đã làm · ${ui.scoped ? "tag «" + ui.label + "»" : "cả môn"}`;
+        el.statPct.hidden = false;
+      } else {
+        el.statPct.textContent = "";
+        el.statPct.removeAttribute("title");
+        el.statPct.hidden = true;
+      }
+    }
+    el.statTotal.textContent = String(queue.length);
+    el.statProgress.textContent = queue.length ? String(index + 1) : "0";
+    const pct = queue.length ? ((index + 1) / queue.length) * 100 : 0;
+    el.progressBar.style.width = pct + "%";
+  }
+
+  function applyMapVisibility() {
+    document.body.classList.toggle("map-hidden", !mapVisible);
+    if (el.sideMap) {
+      el.sideMap.hidden = !mapVisible;
+      el.sideMap.setAttribute("aria-hidden", mapVisible ? "false" : "true");
+    }
+    if (el.btnToggleMap) {
+      el.btnToggleMap.setAttribute("aria-pressed", mapVisible ? "true" : "false");
+      el.btnToggleMap.classList.toggle("is-active", mapVisible);
+    }
+    if (el.mapToggleLabel) {
+      el.mapToggleLabel.textContent = mapVisible ? "Ẩn bản đồ" : "Hiện bản đồ";
+    }
+    if (el.mapToggleIcon) {
+      el.mapToggleIcon.className = mapVisible
+        ? "fa-solid fa-map"
+        : "fa-solid fa-map-location-dot";
+    }
+    try {
+      localStorage.setItem(MAP_VIS_KEY, mapVisible ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function jumpToId(qid) {
+    const i = queue.findIndex((q) => q && q.id === qid);
+    if (i < 0) return;
+    jumpTo(i + 1);
+  }
+
+  function mapCellState(q) {
+    if (!q) return "unseen";
+    const chosen = lastChoice.get(q.id);
+    if (chosen) {
+      return isCorrectSelection(q, chosen) ? "ok" : "bad";
+    }
+    if (wrongIds.has(q.id)) return "bad";
+    return "unseen";
+  }
+
+  /** Bản đồ câu (giống MLN122_FE) — hiển thị queue hiện tại, click để nhảy */
+  function renderQMap() {
+    const map = el.qMap;
+    if (!map) return;
+    const cur = currentQuestion();
+    const list = queue;
+
+    if (el.mapCount) el.mapCount.textContent = String(list.length);
+
+    const MAX = 360;
+    let start = 0;
+    let end = list.length;
+    if (list.length > MAX) {
+      const safePos = Math.min(Math.max(0, index), Math.max(0, list.length - 1));
+      start = Math.max(0, safePos - Math.floor(MAX / 2));
+      end = Math.min(list.length, start + MAX);
+      start = Math.max(0, end - MAX);
+    }
+
+    const frag = document.createDocumentFragment();
+    if (!list.length) {
+      const empty = document.createElement("div");
+      empty.className = "q-map-empty";
+      empty.textContent = "Chưa có câu";
+      frag.appendChild(empty);
+    }
+
+    if (start > 0) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "q-cell";
+      more.textContent = "…";
+      more.title = "Về đầu danh sách";
+      more.addEventListener("click", () => jumpTo(1));
+      frag.appendChild(more);
+    }
+
+    for (let i = start; i < end; i++) {
+      const q = list[i];
+      if (!q) continue;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "q-cell";
+      btn.textContent = String(i + 1);
+      btn.title = `${questionTag(q)} · vị trí ${i + 1}`;
+      btn.setAttribute("role", "listitem");
+      btn.dataset.qid = String(q.id);
+      if (cur && q.id === cur.id) btn.classList.add("is-current");
+      const st = mapCellState(q);
+      if (st === "ok") btn.classList.add("is-ok");
+      if (st === "bad") btn.classList.add("is-bad");
+      btn.addEventListener("click", () => jumpToId(q.id));
+      frag.appendChild(btn);
+    }
+
+    if (end < list.length) {
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "q-cell";
+      more.textContent = "…";
+      more.title = "Tới cuối danh sách";
+      more.addEventListener("click", () => jumpTo(list.length));
+      frag.appendChild(more);
+    }
+
+    map.innerHTML = "";
+    map.appendChild(frag);
+
+    try {
+      const curBtn = map.querySelector(".q-cell.is-current");
+      if (curBtn && typeof curBtn.scrollIntoView === "function") {
+        curBtn.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function updateSubmitUI(q) {
+    if (!el.submitRow || !el.btnSubmit) return;
+    if (!q || answered || !isMulti(q)) {
+      el.submitRow.classList.add("hidden");
+      return;
+    }
+    el.submitRow.classList.remove("hidden");
+    el.btnSubmit.disabled = selectedLetters.length === 0;
+    if (el.submitCount) {
+      el.submitCount.textContent =
+        selectedLetters.length === 0
+          ? "Chưa chọn"
+          : `Đã chọn ${selectedLetters.length}: ${selectedLetters.slice().sort().join(", ")}`;
+    }
+  }
+
+  function render() {
+    _dbgRenderN += 1;
+    const qPeek = currentQuestion();
+    dbg("render", {
+      n: _dbgRenderN,
+      qId: qPeek ? qPeek.id : null,
+      answered,
+      selectedLetters: selectedLetters.slice(),
+    });
+
+    updateBadges();
+
+    const q = currentQuestion();
+    if (!q) {
+      el.quizCard.classList.add("hidden");
+      el.emptyState.classList.remove("hidden");
+      if (mode === "wrong") {
+        const w = examScoreStats().wrong;
+        const tag = currentExamLabel();
+        el.emptyTitle.textContent = w === 0 ? "Chưa có câu sai" : "Hết câu trong hàng đợi";
+        el.emptyDesc.textContent =
+          w === 0
+            ? isScopedExam()
+              ? `Tag «${tag}» chưa có câu sai đã lưu. Thử tab khác hoặc làm bài rồi quay lại.`
+              : "Khi bạn trả lời sai, câu sẽ được lưu ở đây để làm lại."
+            : "Bấm «Xáo lại» hoặc chuyển tab để tiếp tục.";
+      } else {
+        el.emptyTitle.textContent = "Không có câu hỏi";
+        el.emptyDesc.textContent =
+          "File questions.js trống, chưa tải được, hoặc bộ đề đang chọn không có câu.";
+      }
+      el.btnPrev.disabled = true;
+      el.btnNext.disabled = true;
+      el.jumpInput.max = 1;
+      el.jumpInput.value = "";
+      if (el.submitRow) el.submitRow.classList.add("hidden");
+      if (el.multiHint) el.multiHint.classList.add("hidden");
+      renderQMap();
+      return;
+    }
+
+    el.emptyState.classList.add("hidden");
+    el.quizCard.classList.remove("hidden");
+
+    el.quizCard.style.animation = "none";
+    void el.quizCard.offsetWidth;
+    el.quizCard.style.animation = "";
+
+    el.qIndex.innerHTML = `<i class="fa-solid fa-circle-question"></i> Câu ${index + 1} / ${queue.length}`;
+    el.qId.textContent =
+      questionTag(q) + (wrongIds.has(q.id) ? " · đã sai trước đó" : "");
+    el.questionText.textContent = q.question;
+    renderQuestionImage(q);
+
+    const multi = isMulti(q);
+    if (el.multiHint) {
+      el.multiHint.classList.toggle("hidden", !multi || answered);
+    }
+
+    const prev = lastChoice.get(q.id);
+    answered = prev != null;
+    selectedLetters = answered ? prev.slice() : [];
+    const corrects = correctLetters(q);
+    const letters = Object.keys(q.options).sort();
+
+    el.options.innerHTML = "";
+    letters.forEach((letter) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "option" + (multi ? " option-multi" : "");
+      btn.setAttribute("role", "option");
+      btn.dataset.letter = letter;
+      const mark = multi
+        ? `<span class="check-mark"><i class="fa-regular fa-square"></i></span>`
+        : `<span class="letter">${letter}</span>`;
+      btn.innerHTML = `${mark}<span class="opt-text"><span class="opt-letter-inline">${letter}.</span> ${escapeHtml(
+        q.options[letter]
+      )}</span>`;
+      btn.addEventListener("click", () => onToggle(letter));
+      if (answered) {
+        btn.disabled = true;
+        applyOptionState(btn, letter, corrects, selectedLetters);
+      } else if (selectedLetters.includes(letter)) {
+        btn.classList.add("picked");
+        if (multi) {
+          btn.querySelector(".check-mark i")?.classList.replace("fa-regular", "fa-solid");
+          btn.querySelector(".check-mark i")?.classList.replace("fa-square", "fa-square-check");
+        }
+      }
+      el.options.appendChild(btn);
+    });
+
+    if (answered) {
+      showFeedback(isCorrectSelection(q, selectedLetters), q);
+      showExplainPanel(q);
+      showAltPanel(q);
+      if (el.submitRow) el.submitRow.classList.add("hidden");
+    } else {
+      hideFeedback();
+      hideExplainPanel();
+      hideAltPanel();
+      updateSubmitUI(q);
+    }
+
+    el.btnPrev.disabled = index <= 0;
+    el.btnNext.disabled = index >= queue.length - 1;
+    el.jumpInput.max = queue.length;
+    el.jumpInput.value = String(index + 1);
+    renderQMap();
+  }
+
+  /**
+   * @param {HTMLElement} btn
+   * @param {string} letter
+   * @param {string[]} corrects
+   * @param {string[]} chosen
+   */
+  function applyOptionState(btn, letter, corrects, chosen) {
+    const correctSet = corrects || [];
+    const chosenSet = chosen || [];
+    const isCorrect = correctSet.includes(letter);
+    const isChosen = chosenSet.includes(letter);
+
+    if (isCorrect) {
+      btn.classList.add("correct");
+    } else if (isChosen) {
+      btn.classList.add("wrong");
+    } else {
+      btn.classList.add("dimmed");
+    }
+    if (isChosen) btn.classList.add("selected");
+
+    // multi checkbox icons
+    const icon = btn.querySelector(".check-mark i");
+    if (icon) {
+      icon.className = isCorrect
+        ? "fa-solid fa-square-check"
+        : isChosen
+          ? "fa-solid fa-square-xmark"
+          : "fa-regular fa-square";
+    }
+  }
+
+  function formatCorrectAnswer(q) {
+    const letters = correctLetters(q);
+    return letters
+      .map((L) => {
+        const t = (q.options && q.options[L]) || "";
+        return t ? `${L}. ${t}` : L;
+      })
+      .join(" · ");
+  }
+
+  function showFeedback(ok, q) {
+    el.feedback.classList.remove("hidden", "ok", "err");
+    if (ok) {
+      el.feedback.classList.add("ok");
+      const multi = isMulti(q);
+      const msg = multi
+        ? `Chính xác! (Đáp án: ${correctLetters(q).join(", ")})`
+        : "Chính xác!";
+      el.feedback.innerHTML = `<i class="fa-solid fa-circle-check"></i><span>${escapeHtml(msg)}</span>`;
+    } else {
+      el.feedback.classList.add("err");
+      el.feedback.innerHTML = `<i class="fa-solid fa-circle-xmark"></i><span>Sai. Đáp án đúng: ${escapeHtml(
+        formatCorrectAnswer(q)
+      )}</span>`;
+    }
+  }
+
+  function hideFeedback() {
+    el.feedback.classList.add("hidden");
+    el.feedback.innerHTML = "";
+    el.feedback.classList.remove("ok", "err");
+  }
+
+  function hideAltPanel() {
+    if (!el.altPanel) return;
+    el.altPanel.classList.add("hidden");
+    el.altPanel.innerHTML = "";
+  }
+
+  function hideExplainPanel() {
+    if (!el.explainPanel) return;
+    el.explainPanel.classList.add("hidden");
+    el.explainPanel.innerHTML = "";
+    if (el.explainToggleRow) el.explainToggleRow.classList.add("hidden");
+  }
+
+  function updateExplainToggleUI(hasExplain) {
+    if (!el.explainToggleRow || !el.btnToggleExplain) return;
+    if (!hasExplain) {
+      el.explainToggleRow.classList.add("hidden");
+      return;
+    }
+    el.explainToggleRow.classList.remove("hidden");
+    const shown = explainVisible;
+    el.btnToggleExplain.setAttribute("aria-expanded", shown ? "true" : "false");
+    el.btnToggleExplain.classList.toggle("is-collapsed", !shown);
+    if (el.toggleExplainLabel) {
+      el.toggleExplainLabel.textContent = shown ? "Ẩn giải thích" : "Hiện giải thích";
+    }
+    if (el.toggleExplainIcon) {
+      el.toggleExplainIcon.className = shown
+        ? "fa-solid fa-eye-slash"
+        : "fa-solid fa-lightbulb";
+    }
+    if (el.explainPanel) {
+      el.explainPanel.classList.toggle("hidden", !shown);
+    }
+  }
+
+  function questionViOf(q) {
+    if (!q) return "";
+    const exp = effectiveExplanation(q);
+    if (exp.questionVi) return String(exp.questionVi);
+    if (q.questionVi) return String(q.questionVi);
+    return "";
+  }
+
+  function optionsViOf(q) {
+    if (!q) return {};
+    const exp = effectiveExplanation(q);
+    if (exp.optionsVi && typeof exp.optionsVi === "object") return exp.optionsVi;
+    if (q.optionsVi && typeof q.optionsVi === "object") return q.optionsVi;
+    return {};
+  }
+
+  function hasExplainContent(q) {
+    if (!q) return false;
+    const exp = effectiveExplanation(q);
+    return !!(
+      exp.whyCorrect ||
+      exp.concept ||
+      exp.intent ||
+      exp.whyWrong ||
+      exp.memoryTip ||
+      exp.answerDisplay ||
+      questionViOf(q) ||
+      Object.keys(optionsViOf(q)).length
+    );
+  }
+
+  /**
+   * @param {object} q
+   * @param {{ keepVisOpen?: boolean }} [opts]
+   */
+  function showExplainPanel(q, opts) {
+    if (!el.explainPanel) return;
+    const exp = effectiveExplanation(q);
+    if (!hasExplainContent(q)) {
+      hideExplainPanel();
+      return;
+    }
+
+    const corrects = correctLetters(q);
+    const chosen = lastChoice.get(q.id) || selectedLetters || [];
+    const qv = questionViOf(q);
+    const ov = optionsViOf(q);
+    const letters = Object.keys(q.options || {}).sort();
+    // MLN (và môn hideTranslation): không hiện bảng dịch — đề đã tiếng Việt
+    const hideTrans = !!(CFG && (CFG.hideTranslation || CFG.showTranslationAlways === false && subjectId === "mln"));
+    const hasTranslation =
+      !hideTrans && !!(qv || letters.some((L) => ov[L]));
+
+    let html = `<div class="explain-title-row">`;
+    html += hideTrans
+      ? `<div class="explain-title"><i class="fa-solid fa-lightbulb"></i> Giải thích</div>`
+      : `<div class="explain-title"><i class="fa-solid fa-language"></i> Bảng dịch &amp; giải thích</div>`;
+    html += `<div class="explain-actions">
+      <button type="button" class="btn btn-secondary btn-sm" id="btnExplainVis" title="Chọn phần hiển thị trong giải thích" aria-expanded="false" aria-controls="explainVisPopover">
+        <i class="fa-solid fa-sliders"></i> Hiển thị
+      </button>
+    </div></div>`;
+    html += buildExplainVisPopoverHtml(hideTrans);
+
+    const fmt = (s) =>
+      escapeHtml(
+        // Data lỗi đôi khi lưu literal "\n" thay vì xuống dòng thật
+        String(s || "").replace(/\\n/g, "\n")
+      )
+        .replace(/\n•/g, "<br>•")
+        .replace(/\n/g, "<br>");
+
+    // 🌐 Bảng dịch câu hỏi + lựa chọn (bỏ với MLN / tắt trong cài đặt)
+    if (hasTranslation && explainFieldOn("translation")) {
+      html += `<div class="explain-block explain-trans">
+        <div class="explain-label"><i class="fa-solid fa-book"></i> Câu hỏi</div>
+        <table class="explain-table explain-q">
+          <thead><tr><th style="width:22%">Loại</th><th>Nội dung</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Câu gốc</strong></td><td class="en-cell">${fmt(q.question || "")}</td></tr>
+            <tr><td><strong>Dịch (VI)</strong></td><td>${fmt(qv || "—")}</td></tr>
+          </tbody>
+        </table>
+        <div class="explain-sub">Các lựa chọn</div>
+        <table class="explain-table explain-choices">
+          <thead>
+            <tr>
+              <th>Mã</th>
+              <th>Gốc</th>
+              <th>Bản dịch VI</th>
+              <th>Ghi chú</th>
+            </tr>
+          </thead>
+          <tbody>`;
+      letters.forEach((L) => {
+        const en = (q.options && q.options[L]) || "";
+        const vi = ov[L] || "";
+        const isAns = corrects.includes(L);
+        const isPick = chosen.includes(L);
+        let mark = "";
+        if (isAns) mark = '<span class="tag-ok">ĐÁP ÁN ĐÚNG</span>';
+        else if (isPick) mark = '<span class="tag-bad">Bạn chọn</span>';
+        const rowClass = isAns ? "row-ok" : isPick ? "row-bad" : "";
+        html += `<tr class="${rowClass}">
+          <td><strong>${escapeHtml(L)}</strong></td>
+          <td class="en-cell">${escapeHtml(en)}</td>
+          <td>${escapeHtml(vi || "—")}</td>
+          <td>${mark}</td>
+        </tr>`;
+      });
+      html += `</tbody></table></div>`;
+    }
+
+    // ✅ Đáp án
+    let ansLabel = exp.answerDisplay || "";
+    if (!ansLabel && corrects.length) {
+      ansLabel = corrects
+        .map((L) => {
+          const vi = ov[L];
+          const en = q.options && q.options[L];
+          if (vi) return `${L}. ${vi}`;
+          return en ? `${L}. ${en}` : L;
+        })
+        .join(" | ");
+    }
+    if (ansLabel && explainFieldOn("answer")) {
+      html += `<div class="explain-block explain-ans">
+        <div class="explain-label"><i class="fa-solid fa-circle-check"></i> Đáp án</div>
+        <p class="explain-answer-line">${fmt(ansLabel)}</p>
+      </div>`;
+    }
+
+    // 🎯 Ý chính câu hỏi
+    if (exp.intent && explainFieldOn("intent")) {
+      html += `<div class="explain-block explain-intent">
+        <div class="explain-label"><i class="fa-solid fa-bullseye"></i> Ý chính của câu hỏi</div>
+        <p>${fmt(exp.intent)}</p>
+      </div>`;
+    }
+
+    // 📝 Giải thích đáp án đúng (Đây là gì? ≠ Vì sao đúng?)
+    const showConcept = !!(exp.concept && explainFieldOn("concept"));
+    const showWhy = !!(exp.whyCorrect && explainFieldOn("whyCorrect"));
+    if (showConcept || showWhy) {
+      html += `<div class="explain-block explain-ok">
+        <div class="explain-label"><i class="fa-solid fa-book-open"></i> Giải thích đáp án đúng</div>`;
+      if (showConcept) {
+        html += `<div class="explain-sub">Đây là gì?</div><p>${fmt(exp.concept)}</p>`;
+      }
+      if (showWhy) {
+        html += `<div class="explain-sub">Vì sao đúng?</div><p>${fmt(exp.whyCorrect)}</p>`;
+      }
+      html += `</div>`;
+    }
+
+    // 💡 Mẹo nhớ (giữ nếu có — PRM)
+    if (exp.memoryTip && explainFieldOn("memoryTip")) {
+      html += `<div class="explain-block explain-tip">
+        <div class="explain-label"><i class="fa-solid fa-lightbulb"></i> Mẹo nhớ</div>
+        <p class="explain-tip-line">${fmt(exp.memoryTip)}</p>
+      </div>`;
+    }
+
+    // ❌ Đáp án còn lại: Là gì? / Dùng để làm gì? / Vì sao sai?
+    const wrong = exp.whyWrong || {};
+    const wrongKeys = Object.keys(wrong).sort();
+    if (wrongKeys.length && explainFieldOn("whyWrong")) {
+      html += `<div class="explain-block explain-bad">
+        <div class="explain-label"><i class="fa-solid fa-circle-xmark"></i> Các đáp án còn lại</div>
+        <ul class="explain-list explain-list-teach">`;
+      wrongKeys.forEach((L) => {
+        const optText = ov[L] || (q.options && q.options[L]) || "";
+        const raw = String(wrong[L] || "");
+        let body = fmt(raw);
+        if (!/Là gì\?/i.test(raw) && exp.whatIs && exp.whatIs[L]) {
+          body = fmt(
+            "• Là gì? " +
+              exp.whatIs[L] +
+              "\n• Dùng để làm gì? Xem ngữ cảnh môn học.\n• Vì sao sai? " +
+              raw
+          );
+        }
+        html += `<li class="explain-wrong-item"><strong>${escapeHtml(L)}${
+          optText ? ". " + escapeHtml(optText) : ""
+        }</strong>
+          <div class="explain-wrong-body">${body}</div></li>`;
+      });
+      html += `</ul></div>`;
+    }
+
+    // multi: also list correct options clearly if more than one
+    if (corrects.length > 1 && explainFieldOn("multiKeys")) {
+      html += `<div class="explain-block explain-keys">
+        <div class="explain-label"><i class="fa-solid fa-list-check"></i> Các đáp án đúng</div>
+        <ul class="explain-list">`;
+      corrects.forEach((L) => {
+        const text = ov[L] || (q.options && q.options[L]) || "";
+        html += `<li><strong>${escapeHtml(L)}. ${escapeHtml(text)}</strong></li>`;
+      });
+      html += `</ul></div>`;
+    }
+
+    el.explainPanel.innerHTML = html;
+    bindExplainVisControls(q, !!(opts && opts.keepVisOpen));
+    updateExplainToggleUI(true);
+  }
+
+  function buildExplainVisPopoverHtml(hideTrans) {
+    const fields = [
+      !hideTrans && { key: "translation", label: "Bảng dịch (đề + lựa chọn)" },
+      { key: "answer", label: "Đáp án" },
+      { key: "intent", label: "Ý chính của câu hỏi" },
+      { key: "concept", label: "Đây là gì? (concept)" },
+      { key: "whyCorrect", label: "Vì sao đúng?" },
+      { key: "memoryTip", label: "Mẹo nhớ" },
+      { key: "whyWrong", label: "Các đáp án còn lại" },
+      { key: "multiKeys", label: "Danh sách đáp án đúng (multi)" },
+    ].filter(Boolean);
+
+    let h = `<div class="explain-vis-popover hidden" id="explainVisPopover" role="dialog" aria-label="Phần hiển thị giải thích">
+      <div class="explain-vis-head">Hiển thị trong giải thích</div>
+      <p class="explain-vis-hint">Chỉ ẩn/hiện phần xem. Không sửa nội dung. Lưu trên trình duyệt.</p>
+      <div class="explain-vis-list">`;
+    for (const f of fields) {
+      const on = explainFieldOn(f.key);
+      h += `<label class="explain-vis-item">
+        <input type="checkbox" data-explain-vis="${escapeHtml(f.key)}" ${on ? "checked" : ""} />
+        <span>${escapeHtml(f.label)}</span>
+      </label>`;
+    }
+    h += `</div>
+      <div class="explain-vis-actions">
+        <button type="button" class="btn btn-secondary btn-sm" id="btnExplainVisAll">Bật hết</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="btnExplainVisReset">Mặc định</button>
+      </div>
+    </div>`;
+    return h;
+  }
+
+  function bindExplainVisControls(q, keepOpen) {
+    if (!el.explainPanel || !q) return;
+    const btn = el.explainPanel.querySelector("#btnExplainVis");
+    const pop = el.explainPanel.querySelector("#explainVisPopover");
+    if (!btn || !pop) return;
+
+    if (keepOpen) {
+      pop.classList.remove("hidden");
+      btn.setAttribute("aria-expanded", "true");
+    }
+
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const willOpen = pop.classList.contains("hidden");
+      if (willOpen) {
+        pop.classList.remove("hidden");
+        btn.setAttribute("aria-expanded", "true");
+      } else {
+        pop.classList.add("hidden");
+        btn.setAttribute("aria-expanded", "false");
+      }
+    });
+
+    pop.addEventListener("click", (e) => e.stopPropagation());
+
+    const refreshKeepOpen = () => showExplainPanel(q, { keepVisOpen: true });
+
+    pop.querySelectorAll("input[data-explain-vis]").forEach((inp) => {
+      inp.addEventListener("change", () => {
+        const key = inp.getAttribute("data-explain-vis");
+        if (!key || !(key in EXPLAIN_VIS_DEFAULT)) return;
+        explainVis[key] = !!inp.checked;
+        saveExplainVis();
+        refreshKeepOpen();
+      });
+    });
+
+    const allBtn = pop.querySelector("#btnExplainVisAll");
+    if (allBtn) {
+      allBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        for (const k of Object.keys(EXPLAIN_VIS_DEFAULT)) explainVis[k] = true;
+        saveExplainVis();
+        refreshKeepOpen();
+      });
+    }
+    const resetBtn = pop.querySelector("#btnExplainVisReset");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        explainVis = { ...EXPLAIN_VIS_DEFAULT };
+        saveExplainVis();
+        refreshKeepOpen();
+      });
+    }
+
+    // click outside closes
+    setTimeout(() => {
+      const onDoc = (ev) => {
+        if (!el.explainPanel) return;
+        const p = el.explainPanel.querySelector("#explainVisPopover");
+        const b = el.explainPanel.querySelector("#btnExplainVis");
+        if (!p || p.classList.contains("hidden")) return;
+        if (p.contains(ev.target) || (b && b.contains(ev.target))) return;
+        p.classList.add("hidden");
+        if (b) b.setAttribute("aria-expanded", "false");
+        document.removeEventListener("click", onDoc);
+      };
+      document.addEventListener("click", onDoc);
+    }, 0);
+  }
+
+  function openExplainEditor(q) {
+    if (!el.explainPanel || !q) return;
+    const exp = effectiveExplanation(q);
+    const letters = Object.keys(q.options || {}).sort();
+    const ov = exp.optionsVi || {};
+    const ww = exp.whyWrong || {};
+    const wi = exp.whatIs || {};
+
+    let form = `<div class="explain-editor" data-qid="${escapeHtml(String(q.id))}">
+      <div class="explain-editor-head">
+        <strong><i class="fa-solid fa-pen-to-square"></i> Sửa giải thích</strong>
+        <span class="explain-editor-meta">${escapeHtml(questionTag(q))} · id ${escapeHtml(String(q.id))}</span>
+      </div>
+      <p class="explain-editor-hint">Lưu trên trình duyệt (local). Rebuild pipeline không xóa override. Dùng <em>Export</em> để lấy JSON patch áp vào bank.</p>
+
+      <label class="explain-field"><span>Dịch đề (questionVi)</span>
+        <textarea id="ee_questionVi" rows="3">${escapeHtml(exp.questionVi || "")}</textarea>
+      </label>`;
+
+    letters.forEach((L) => {
+      const raw = (q.options && q.options[L]) || "";
+      form += `<label class="explain-field"><span>optionsVi ${escapeHtml(L)} <em class="muted">${escapeHtml(String(raw).slice(0, 60))}${String(raw).length > 60 ? "…" : ""}</em></span>
+        <textarea id="ee_opt_${escapeHtml(L)}" rows="2">${escapeHtml(ov[L] || "")}</textarea>
+      </label>`;
+    });
+
+    form += `<label class="explain-field"><span>Đáp án hiển thị (answerDisplay)</span>
+        <textarea id="ee_answerDisplay" rows="2">${escapeHtml(exp.answerDisplay || "")}</textarea>
+      </label>
+      <label class="explain-field"><span>Ý chính (intent)</span>
+        <textarea id="ee_intent" rows="3">${escapeHtml(exp.intent || "")}</textarea>
+      </label>
+      <label class="explain-field"><span>Đây là gì? (concept)</span>
+        <textarea id="ee_concept" rows="3">${escapeHtml(exp.concept || "")}</textarea>
+      </label>
+      <label class="explain-field"><span>Vì sao đúng? (whyCorrect)</span>
+        <textarea id="ee_whyCorrect" rows="4">${escapeHtml(exp.whyCorrect || "")}</textarea>
+      </label>
+      <label class="explain-field"><span>Mẹo nhớ (memoryTip)</span>
+        <textarea id="ee_memoryTip" rows="2">${escapeHtml(exp.memoryTip || "")}</textarea>
+      </label>`;
+
+    letters.forEach((L) => {
+      if (correctLetters(q).includes(L)) return;
+      form += `<label class="explain-field"><span>whyWrong ${escapeHtml(L)}</span>
+        <textarea id="ee_ww_${escapeHtml(L)}" rows="4">${escapeHtml(ww[L] || "")}</textarea>
+      </label>`;
+      form += `<label class="explain-field"><span>whatIs ${escapeHtml(L)} (tuỳ chọn)</span>
+        <textarea id="ee_wi_${escapeHtml(L)}" rows="2">${escapeHtml(wi[L] || "")}</textarea>
+      </label>`;
+    });
+
+    form += `<div class="explain-editor-actions">
+        <button type="button" class="btn btn-primary btn-sm" id="ee_save"><i class="fa-solid fa-floppy-disk"></i> Lưu local</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="ee_cancel"><i class="fa-solid fa-xmark"></i> Hủy</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="ee_reset" ${hasExplainOverride(q) ? "" : "disabled"}><i class="fa-solid fa-rotate-left"></i> Xóa override câu này</button>
+      </div>
+    </div>`;
+
+    el.explainPanel.innerHTML = form;
+    updateExplainToggleUI(true);
+
+    const $id = (id) => el.explainPanel.querySelector("#" + id);
+    const cancel = () => {
+      showExplainPanel(q);
+    };
+    const save = () => {
+      const patch = {
+        questionVi: ($id("ee_questionVi") && $id("ee_questionVi").value) || "",
+        answerDisplay: ($id("ee_answerDisplay") && $id("ee_answerDisplay").value) || "",
+        intent: ($id("ee_intent") && $id("ee_intent").value) || "",
+        concept: ($id("ee_concept") && $id("ee_concept").value) || "",
+        whyCorrect: ($id("ee_whyCorrect") && $id("ee_whyCorrect").value) || "",
+        memoryTip: ($id("ee_memoryTip") && $id("ee_memoryTip").value) || "",
+        optionsVi: {},
+        whyWrong: {},
+        whatIs: {},
+      };
+      letters.forEach((L) => {
+        const ot = $id("ee_opt_" + L);
+        if (ot && ot.value.trim()) patch.optionsVi[L] = ot.value.trim();
+        if (!correctLetters(q).includes(L)) {
+          const w = $id("ee_ww_" + L);
+          const wiEl = $id("ee_wi_" + L);
+          if (w && w.value.trim()) patch.whyWrong[L] = w.value.trim();
+          if (wiEl && wiEl.value.trim()) patch.whatIs[L] = wiEl.value.trim();
+        }
+      });
+      // Drop empty containers
+      if (!Object.keys(patch.optionsVi).length) delete patch.optionsVi;
+      if (!Object.keys(patch.whyWrong).length) delete patch.whyWrong;
+      if (!Object.keys(patch.whatIs).length) delete patch.whatIs;
+      ["questionVi", "answerDisplay", "intent", "concept", "whyCorrect", "memoryTip"].forEach((k) => {
+        if (!String(patch[k] || "").trim()) delete patch[k];
+      });
+
+      explainOverrides[String(q.id)] = patch;
+      saveExplainOverrides();
+      showToast("Đã lưu giải thích local (id " + q.id + ").");
+      showExplainPanel(q);
+    };
+    const reset = async () => {
+      const ok = await confirmDialog(
+        "Xóa bản sửa local của câu này và trở về data gốc?",
+        { title: "Xóa override", okText: "Xóa", cancelText: "Huỷ" }
+      );
+      if (!ok) return;
+      delete explainOverrides[String(q.id)];
+      saveExplainOverrides();
+      showToast("Đã xóa override câu " + q.id + ".");
+      showExplainPanel(q);
+    };
+
+    if ($id("ee_save")) $id("ee_save").addEventListener("click", save);
+    if ($id("ee_cancel")) $id("ee_cancel").addEventListener("click", cancel);
+    if ($id("ee_reset")) $id("ee_reset").addEventListener("click", reset);
+  }
+
+  function exportExplainPatches() {
+    const ids = Object.keys(explainOverrides);
+    if (!ids.length) {
+      showToast("Chưa có override local nào cho môn " + subjectId + ".");
+      return;
+    }
+    const payload = {
+      subject: subjectId,
+      dataKey: CFG.dataKey || subjectId,
+      exportedAt: new Date().toISOString(),
+      count: ids.length,
+      patches: explainOverrides,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const a = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    a.href = url;
+    a.download = `explain-patch-${subjectId}-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    showToast("Đã tải patch " + ids.length + " câu. Áp bằng: node quiz/tools/apply_explain_patches.mjs <file>");
+  }
+
+  function showAltPanel(q) {
+    if (!el.altPanel) return;
+    const alts = (q && q.alternatives) || [];
+    if (!alts.length) {
+      hideAltPanel();
+      return;
+    }
+
+    let html = `<div class="alt-panel-title"><i class="fa-solid fa-retweet"></i> Kiểu hỏi khác <span style="font-weight:600;text-transform:none;letter-spacing:0;color:var(--muted)">(${alts.length})</span></div>`;
+
+    alts.forEach((alt, idx) => {
+      const aq = escapeHtml(alt.question || "Biến thể");
+      const opts = alt.options && typeof alt.options === "object" ? alt.options : {};
+      const letters = Object.keys(opts).sort();
+      const ansLetter = alt.answer || null;
+      const ansText = alt.answerText || (ansLetter && opts[ansLetter]) || "";
+
+      html += `<div class="alt-card">`;
+      html += `<div class="alt-label"><i class="fa-solid fa-clone"></i> Biến thể ${idx + 1}</div>`;
+      html += `<p class="alt-question">${aq}</p>`;
+
+      if (letters.length) {
+        html += `<div class="alt-options">`;
+        letters.forEach((L) => {
+          const isOk = ansLetter && String(ansLetter).includes(L);
+          html += `<div class="alt-opt${isOk ? " is-correct" : ""}">`;
+          html += `<span class="alt-letter">${escapeHtml(L)}</span>`;
+          html += `<span>${escapeHtml(opts[L] || "")}</span>`;
+          html += `</div>`;
+        });
+        html += `</div>`;
+      }
+
+      const aexp = alt.explanation || {};
+      const ansDisp = aexp.answerDisplay || (ansLetter
+        ? `${ansLetter}${ansText ? ". " + ansText : ""}`
+        : ansText || "");
+      if (ansDisp) {
+        html += `<p class="alt-answer"><i class="fa-solid fa-check"></i><span>Đáp án: ${escapeHtml(String(ansDisp))}</span></p>`;
+      } else {
+        html += `<p class="alt-answer warn"><i class="fa-solid fa-triangle-exclamation"></i><span>Chưa có đáp án trong dữ liệu nguồn</span></p>`;
+      }
+      if (aexp.whyCorrect) {
+        html += `<p class="alt-explain"><i class="fa-solid fa-book-open"></i> ${escapeHtml(aexp.whyCorrect)}</p>`;
+      }
+      if (aexp.memoryTip) {
+        html += `<p class="alt-tip"><i class="fa-solid fa-lightbulb"></i> Mẹo: ${escapeHtml(aexp.memoryTip)}</p>`;
+      }
+      const aw = aexp.whyWrong || {};
+      const awKeys = Object.keys(aw).sort();
+      if (awKeys.length) {
+        html += `<ul class="alt-wrong-list">`;
+        awKeys.forEach((L) => {
+          const ot = opts[L] || "";
+          html += `<li><strong>${escapeHtml(L)}${ot ? ". " + escapeHtml(ot) : ""}</strong> — ${escapeHtml(aw[L])}</li>`;
+        });
+        html += `</ul>`;
+      }
+      html += `</div>`;
+    });
+
+    el.altPanel.innerHTML = html;
+    el.altPanel.classList.remove("hidden");
+  }
+
+  // —— Selection ——
+  function onToggle(letter) {
+    const q = currentQuestion();
+    if (!q || answered) return;
+
+    if (!isMulti(q)) {
+      // single choice — submit immediately
+      commitAnswer(q, [letter]);
+      return;
+    }
+
+    // multi: toggle
+    const i = selectedLetters.indexOf(letter);
+    if (i >= 0) selectedLetters.splice(i, 1);
+    else selectedLetters.push(letter);
+
+    // refresh picked UI without full re-render of feedback
+    el.options.querySelectorAll(".option").forEach((btn) => {
+      const L = btn.dataset.letter;
+      const on = selectedLetters.includes(L);
+      btn.classList.toggle("picked", on);
+      const icon = btn.querySelector(".check-mark i");
+      if (icon) {
+        icon.className = on ? "fa-solid fa-square-check" : "fa-regular fa-square";
+      }
+    });
+    updateSubmitUI(q);
+  }
+
+  function commitAnswer(q, chosen) {
+    if (!q || answered) return;
+    answered = true;
+    selectedLetters = chosen.slice().sort();
+    const qid = Number(q.id);
+    lastChoice.set(qid, selectedLetters.slice());
+
+    const ok = isCorrectSelection(q, selectedLetters);
+    // correctIds = nguồn điểm bền (cùng kiểu wrongIds — sống sót F5/cloud)
+    if (ok) {
+      correctIds.add(qid);
+      if (mode === "wrong") removeWrong(qid);
+    } else {
+      correctIds.delete(qid);
+      addWrong(qid);
+    }
+    sessionAnswered = Math.max(sessionAnswered + 0, lastChoice.size, correctIds.size);
+    // +1 nếu trả lời câu mới (lastChoice đã set nên size phản ánh)
+    if (sessionAnswered < lastChoice.size) sessionAnswered = lastChoice.size;
+    syncScoreFromSets();
+
+    const corrects = correctLetters(q);
+    el.options.querySelectorAll(".option").forEach((btn) => {
+      btn.disabled = true;
+      applyOptionState(btn, btn.dataset.letter, corrects, selectedLetters);
+    });
+
+    if (el.multiHint) el.multiHint.classList.add("hidden");
+    if (el.submitRow) el.submitRow.classList.add("hidden");
+
+    showFeedback(ok, q);
+    showExplainPanel(q);
+    showAltPanel(q);
+    // Lưu correctIds ngay lập tức (trước updateBadges/render)
+    saveCorrectIdsLocal();
+    saveScoreLocal();
+    updateBadges();
+    renderQMap();
+    // Lưu ngay vị trí + đáp án + điểm (local + cloud)
+    persistState({ immediate: true });
+  }
+
+  function submitMulti() {
+    const q = currentQuestion();
+    if (!q || answered || !isMulti(q) || selectedLetters.length === 0) return;
+    commitAnswer(q, selectedLetters);
+  }
+
+  function go(delta) {
+    const next = index + delta;
+    dbg("go", {
+      delta,
+      fromIndex: index,
+      toIndex: next,
+      fromId: queue[index] ? queue[index].id : null,
+      toId: queue[next] ? queue[next].id : null,
+      blocked: next < 0 || next >= queue.length,
+    });
+    if (next < 0 || next >= queue.length) return;
+    index = next;
+    answered = false;
+    selectedLetters = [];
+    hideExplainPanel();
+    hideAltPanel();
+    render();
+    persistState({ immediate: true });
+  }
+
+  function jumpTo(n) {
+    const i = Number(n) - 1;
+    dbg("jumpTo", {
+      raw: n,
+      targetIndex: i,
+      fromIndex: index,
+      fromId: queue[index] ? queue[index].id : null,
+      toId: queue[i] ? queue[i].id : null,
+      blocked: !Number.isFinite(i) || i < 0 || i >= queue.length,
+    });
+    if (!Number.isFinite(i) || i < 0 || i >= queue.length) return;
+    index = i;
+    answered = false;
+    selectedLetters = [];
+    hideExplainPanel();
+    hideAltPanel();
+    render();
+    persistState({ immediate: true });
+  }
+
+  function setMode(newMode) {
+    if (newMode === mode) return;
+    applyUiMode(newMode);
+    rebuildQueue(null);
+    persistState({ immediate: true });
+  }
+
+  // —— Search ——
+  function hideSearchResults() {
+    if (!el.searchResults) return;
+    el.searchResults.classList.add("hidden");
+    el.searchResults.innerHTML = "";
+  }
+
+  function runSearch(q) {
+    searchQuery = (q || "").trim();
+    if (el.btnClearSearch) {
+      el.btnClearSearch.classList.toggle("hidden", !searchQuery);
+    }
+    if (!searchQuery) {
+      hideSearchResults();
+      return;
+    }
+    const tokens = searchQuery
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (!tokens.length) {
+      hideSearchResults();
+      return;
+    }
+
+    const pool =
+      mode === "wrong"
+        ? examPool().filter((x) => wrongIds.has(x.id))
+        : examPool();
+    const hits = [];
+    for (const item of pool) {
+      const hay = (
+        item.question +
+        " " +
+        Object.values(item.options || {}).join(" ") +
+        " " +
+        (item.examLabel || "") +
+        " " +
+        (item.exam || "")
+      ).toLowerCase();
+      if (tokens.every((t) => hay.includes(t))) {
+        hits.push(item);
+        if (hits.length >= 40) break;
+      }
+    }
+
+    if (!hits.length) {
+      el.searchResults.innerHTML = `<div class="search-empty"><i class="fa-solid fa-magnifying-glass"></i> Không tìm thấy câu nào</div>`;
+      el.searchResults.classList.remove("hidden");
+      return;
+    }
+
+    el.searchResults.innerHTML = hits
+      .map((item) => {
+        const snippet = escapeHtml(item.question.length > 120 ? item.question.slice(0, 120) + "…" : item.question);
+        return `<button type="button" class="search-item" data-id="${item.id}" role="option">
+          <span class="search-item-id">${escapeHtml(questionTag(item))}</span>
+          <span class="search-item-text">${snippet}</span>
+        </button>`;
+      })
+      .join("");
+    el.searchResults.classList.remove("hidden");
+
+    el.searchResults.querySelectorAll(".search-item").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        goToQuestionId(Number(btn.dataset.id));
+      });
+    });
+  }
+
+  // —— Events ——
+  document.querySelectorAll(".tab[data-tab]").forEach((t) => {
+    t.addEventListener("click", () => setMode(t.dataset.tab));
+  });
+
+  document.querySelectorAll(".exam-tab[data-exam]").forEach((t) => {
+    t.addEventListener("click", () => setExamSet(t.dataset.exam));
+  });
+
+  el.btnPrev.addEventListener("click", () => go(-1));
+  el.btnNext.addEventListener("click", () => go(1));
+  el.btnJump.addEventListener("click", () => jumpTo(el.jumpInput.value));
+  el.jumpInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      jumpTo(el.jumpInput.value);
+    }
+  });
+
+  if (el.btnSubmit) {
+    el.btnSubmit.addEventListener("click", submitMulti);
+  }
+
+  el.shuffleToggle.addEventListener("change", () => {
+    // CHỈ toggle này bật/tắt chế độ Ngẫu nhiên — không liên quan nút Xáo lại.
+    dbg("shuffleToggle:change", {
+      checked: el.shuffleToggle.checked,
+      prevIndex: index,
+    });
+    syncReshuffleBtn();
+    rebuildQueue(null); // bật = xáo + về Câu 1; tắt = thứ tự gốc + về Câu 1
+    persistState();
+  });
+
+  el.btnReshuffle.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Xáo lại = xáo lại thứ tự hiện tại. KHÔNG BAO GIỜ gán shuffleToggle.checked.
+    if (!el.shuffleToggle.checked) {
+      showToast("Bật «Ngẫu nhiên» trước — Xáo lại không tự bật chế độ này.");
+      syncReshuffleBtn();
+      return;
+    }
+    dbg("btnReshuffle:click", { shuffleOn: true, forceShuffle: true });
+    rebuildQueue(null, { forceShuffle: true });
+    persistState();
+    showToast("Đã xáo lại thứ tự câu hỏi.");
+  });
+
+  el.btnResetSession.addEventListener("click", () => {
+    const label = currentExamLabel();
+    const scoped = isScopedExam();
+    let cleared = 0;
+
+    if (!scoped) {
+      // Tab «Tất cả»: reset toàn môn
+      cleared = correctIds.size;
+      lastChoice = new Map();
+      correctIds = new Set();
+      sessionCorrect = 0;
+      sessionAnswered = 0;
+      try {
+        localStorage.removeItem(SCORE_KEY);
+        localStorage.removeItem(CORRECT_KEY);
+      } catch {
+        /* ignore */
+      }
+      // Không gọi syncScoreFromSets — tránh kéo lại answered từ wrongIds
+      recomputeSessionStatsFromChoices({ force: true });
+    } else {
+      // Chỉ xóa điểm / đáp án đã chọn thuộc tag đang làm
+      const scope = examPoolIdSet();
+      cleared = correctIdsInExamPool().length;
+      for (const id of [...lastChoice.keys()]) {
+        if (scope.has(Number(id))) lastChoice.delete(id);
+      }
+      correctIds = new Set(
+        [...correctIds].filter((id) => !scope.has(Number(id)))
+      );
+      // Không wipe SCORE_KEY/CORRECT_KEY toàn cục — còn data tag khác
+      saveCorrectIdsLocal();
+      recomputeSessionStatsFromChoices({ force: true });
+      syncScoreFromSets();
+    }
+
+    answered = false;
+    selectedLetters = [];
+    updateBadges();
+    render();
+    persistState({ immediate: true });
+    showToast(
+      scoped
+        ? `Đã reset điểm tag «${label}»${cleared ? ` (${cleared} câu đúng đã xóa)` : ""}.`
+        : "Đã reset điểm toàn bộ môn."
+    );
+  });
+
+  /** @type {HTMLElement | null} */
+  let toastEl = null;
+  let toastTimer = null;
+  function showToast(message) {
+    if (!toastEl) {
+      toastEl = document.createElement("div");
+      toastEl.id = "prmToast";
+      toastEl.className = "mln-toast";
+      toastEl.setAttribute("role", "status");
+      document.body.appendChild(toastEl);
+    }
+    toastEl.textContent = message;
+    toastEl.classList.add("is-on");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      toastEl.classList.remove("is-on");
+    }, 2800);
+  }
+
+  /**
+   * Modal confirm tự vẽ (không dùng window.confirm — iPad hay chặn).
+   * @param {string} message
+   * @param {{title?: string, okText?: string, cancelText?: string}} [opts]
+   * @returns {Promise<boolean>}
+   */
+  function ensureConfirmModal() {
+    let modal = document.getElementById("confirmModal");
+    if (modal) return modal;
+
+    modal = document.createElement("div");
+    modal.id = "confirmModal";
+    modal.className = "modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.innerHTML =
+      '<div class="modal-backdrop" data-confirm-cancel="1"></div>' +
+      '<div class="modal-panel" role="document">' +
+      '  <div class="modal-icon" aria-hidden="true"><i class="fa-solid fa-trash-can"></i></div>' +
+      '  <h3 class="modal-title" id="confirmTitle">Xác nhận</h3>' +
+      '  <p class="modal-msg" id="confirmMsg"></p>' +
+      '  <div class="modal-actions">' +
+      '    <button type="button" class="btn btn-secondary" id="confirmCancel">Hủy</button>' +
+      '    <button type="button" class="btn btn-danger" id="confirmOk">Xóa</button>' +
+      "  </div>" +
+      "</div>";
+    document.body.appendChild(modal);
+    return modal;
+  }
+
+  function hideConfirmModal(modal) {
+    if (!modal) return;
+    modal.classList.add("hidden");
+    modal.setAttribute("hidden", "");
+    modal.style.display = "none";
+    document.body.classList.remove("modal-open");
+  }
+
+  function showConfirmModal(modal) {
+    modal.classList.remove("hidden");
+    modal.removeAttribute("hidden");
+    // Inline style để chắc chắn hiện trên iOS (UA stylesheet + cache CSS)
+    modal.style.cssText =
+      "display:flex;position:fixed;inset:0;z-index:9999;align-items:center;justify-content:center;padding:16px;";
+    document.body.classList.add("modal-open");
+  }
+
+  function confirmDialog(message, opts) {
+    const options = opts || {};
+    const modal = ensureConfirmModal();
+    const msgEl = modal.querySelector("#confirmMsg") || document.getElementById("confirmMsg");
+    const titleEl = modal.querySelector("#confirmTitle") || document.getElementById("confirmTitle");
+    const btnOk = modal.querySelector("#confirmOk") || document.getElementById("confirmOk");
+    const btnCancel = modal.querySelector("#confirmCancel") || document.getElementById("confirmCancel");
+
+    if (!msgEl || !btnOk || !btnCancel) {
+      showToast(message + " (không mở được hộp thoại)");
+      return Promise.resolve(false);
+    }
+
+    if (titleEl) titleEl.textContent = options.title || "Xác nhận";
+    msgEl.textContent = message;
+    btnOk.textContent = options.okText || "Xóa";
+    btnCancel.textContent = options.cancelText || "Hủy";
+
+    showConfirmModal(modal);
+
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        hideConfirmModal(modal);
+        btnOk.removeEventListener("click", onOk);
+        btnCancel.removeEventListener("click", onCancel);
+        btnOk.removeEventListener("touchend", onOkTouch);
+        btnCancel.removeEventListener("touchend", onCancelTouch);
+        modal.removeEventListener("click", onBackdrop);
+        document.removeEventListener("keydown", onKey);
+        resolve(ok);
+      };
+      const onOk = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(true);
+      };
+      const onCancel = (e) => {
+        if (e) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        finish(false);
+      };
+      // touchend + preventDefault tránh 300ms / mất click trên iOS
+      const onOkTouch = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(true);
+      };
+      const onCancelTouch = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+      };
+      const onBackdrop = (e) => {
+        const t = e.target;
+        if (t && t.getAttribute && t.getAttribute("data-confirm-cancel")) {
+          finish(false);
+        }
+      };
+      const onKey = (e) => {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          finish(false);
+        }
+      };
+
+      btnOk.addEventListener("click", onOk);
+      btnCancel.addEventListener("click", onCancel);
+      btnOk.addEventListener("touchend", onOkTouch, { passive: false });
+      btnCancel.addEventListener("touchend", onCancelTouch, { passive: false });
+      modal.addEventListener("click", onBackdrop);
+      document.addEventListener("keydown", onKey);
+    });
+  }
+
+  /** Xóa câu sai theo tag đang chọn (hoặc toàn môn nếu «Tất cả»). */
+  function clearWrongForCurrentExam() {
+    const label = currentExamLabel();
+    const scoped = isScopedExam();
+    let removed = 0;
+
+    if (!scoped) {
+      removed = wrongIds.size;
+      wrongIds = new Set();
+    } else {
+      const scope = examPoolIdSet();
+      const next = new Set();
+      wrongIds.forEach((id) => {
+        if (scope.has(Number(id))) removed += 1;
+        else next.add(id);
+      });
+      wrongIds = next;
+    }
+
+    saveWrongIds();
+    if (mode === "wrong") rebuildQueue(null);
+    else {
+      updateBadges();
+      render();
+    }
+    showToast(
+      scoped
+        ? `Đã xóa ${removed} câu sai trong tag «${label}».`
+        : `Đã xóa hết ${removed} câu sai đã lưu.`
+    );
+  }
+
+  let clearWrongLockUntil = 0;
+  function onClearWrongClick(e) {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    const now = Date.now();
+    // Tránh touchend + click mở modal 2 lần trên iPad
+    if (now < clearWrongLockUntil) return;
+    clearWrongLockUntil = now + 500;
+
+    const scoped = isScopedExam();
+    const label = currentExamLabel();
+    const scopedWrong = wrongIdsInExamPool();
+    const n = scoped ? scopedWrong.length : wrongIds.size;
+
+    if (n === 0) {
+      showToast(
+        scoped
+          ? `Tag «${label}» chưa có câu sai để xóa.`
+          : "Chưa có câu sai nào để xóa."
+      );
+      return;
+    }
+    // Đang mở modal rồi thì thôi
+    if (document.body.classList.contains("modal-open")) return;
+
+    const msg = scoped
+      ? `Xóa ${n} câu sai trong tag «${label}»? Các tag khác giữ nguyên. Không hoàn tác.`
+      : `Xóa ${n} câu sai đã lưu (toàn bộ môn)? Hành động này không hoàn tác.`;
+
+    confirmDialog(msg, {
+      title: scoped ? `Xóa câu sai · ${label}` : "Xóa câu sai",
+      okText: scoped ? "Xóa tag này" : "Xóa hết",
+      cancelText: "Hủy",
+    }).then((ok) => {
+      if (ok) clearWrongForCurrentExam();
+    });
+  }
+
+  if (el.btnClearWrong) {
+    el.btnClearWrong.addEventListener("click", onClearWrongClick);
+    // iPad: touchend (preventDefault) nếu synthetic click bị nuốt
+    el.btnClearWrong.addEventListener(
+      "touchend",
+      (e) => {
+        e.preventDefault();
+        onClearWrongClick(e);
+      },
+      { passive: false }
+    );
+  }
+
+  el.btnGoAll.addEventListener("click", () => setMode("all"));
+
+  if (el.btnToggleExplain) {
+    el.btnToggleExplain.addEventListener("click", () => {
+      explainVisible = !explainVisible;
+      const q = currentQuestion();
+      const has = answered && hasExplainContent(q);
+      updateExplainToggleUI(!!has);
+      persistState();
+    });
+  }
+
+  if (el.btnToggleMap) {
+    el.btnToggleMap.addEventListener("click", () => {
+      mapVisible = !mapVisible;
+      applyMapVisibility();
+      if (mapVisible) renderQMap();
+    });
+  }
+  applyMapVisibility();
+
+  if (el.searchInput) {
+    let searchTimer = null;
+    el.searchInput.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => runSearch(el.searchInput.value), 180);
+    });
+    el.searchInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        el.searchInput.value = "";
+        runSearch("");
+        el.searchInput.blur();
+      }
+    });
+  }
+  if (el.btnClearSearch) {
+    el.btnClearSearch.addEventListener("click", () => {
+      if (el.searchInput) el.searchInput.value = "";
+      runSearch("");
+      el.searchInput?.focus();
+    });
+  }
+
+  // click outside search closes results
+  document.addEventListener("click", (e) => {
+    if (!el.searchResults || el.searchResults.classList.contains("hidden")) return;
+    const t = e.target;
+    if (el.searchResults.contains(t) || el.searchInput?.contains(t) || el.btnClearSearch?.contains(t)) return;
+    // keep results visible while typing; only hide when clicking far? better keep until clear
+  });
+
+  // Chỉ chuyển câu bằng nút Trước/Sau (và ô nhảy số). Không vuốt, không phím mũi tên trên tablet.
+  const isCoarsePointer =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+
+  document.addEventListener("keydown", (e) => {
+    if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) {
+      return;
+    }
+
+    // iPad/tablet: tắt phím ← → (tránh nhảy câu ngoài ý muốn)
+    if (!isCoarsePointer && e.key === "ArrowLeft") {
+      e.preventDefault();
+      go(-1);
+    } else if (!isCoarsePointer && e.key === "ArrowRight") {
+      e.preventDefault();
+      go(1);
+    } else if (e.key === "Enter") {
+      const q = currentQuestion();
+      if (q && !answered && isMulti(q) && selectedLetters.length) {
+        e.preventDefault();
+        submitMulti();
+      } else if (!answered) {
+        // don't auto next on enter for single
+      } else if (!isCoarsePointer) {
+        e.preventDefault();
+        go(1);
+      }
+    } else if (e.key >= "1" && e.key <= "6") {
+      const q = currentQuestion();
+      if (!q || answered) return;
+      const letters = Object.keys(q.options).sort();
+      const letter = letters[Number(e.key) - 1];
+      if (letter) onToggle(letter);
+    } else if (/^[a-fA-F]$/.test(e.key)) {
+      const q = currentQuestion();
+      if (!q || answered) return;
+      const letter = e.key.toUpperCase();
+      if (q.options[letter]) onToggle(letter);
+    }
+  });
+
+  // Không đăng ký touchstart/touchend để vuốt chuyển câu.
+
+  // jump input changes (phát hiện nhảy liên tục do value/max update)
+  if (el.jumpInput) {
+    el.jumpInput.addEventListener("input", () => {
+      dbg("jumpInput:input", { value: el.jumpInput.value });
+    });
+    el.jumpInput.addEventListener("change", () => {
+      dbg("jumpInput:change", { value: el.jumpInput.value });
+    });
+  }
+
+
+  function paintSubjectChrome() {
+    const brandStrong = document.querySelector(".brand-text strong");
+    const brandSpan = document.querySelector(".brand-text span");
+    const brandIcon = document.querySelector(".brand-mark i");
+    if (brandStrong) brandStrong.textContent = "Quiz " + (CFG.title || subjectId);
+    if (brandSpan) brandSpan.textContent = CFG.subtitle || "";
+    if (brandIcon && CFG.brandIcon) brandIcon.className = "fa-solid " + CFG.brandIcon;
+    document.title = (CFG.title || "Quiz") + " — Unified Quiz Hub";
+    const hint = document.querySelector("p.hint");
+    if (hint && CFG.hint) {
+      hint.innerHTML =
+        '<i class="fa-solid fa-hand-pointer"></i> ' +
+        CFG.hint +
+        ' <span class="hint-desk"> · Máy tính: <kbd>A</kbd>–<kbd>F</kbd> · multi: <kbd>Enter</kbd></span>';
+    }
+    document.querySelectorAll(".subject-tab").forEach((btn) => {
+      const on = btn.getAttribute("data-subject") === subjectId;
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    const taskTabs = document.getElementById("taskTabs");
+    if (taskTabs) {
+      // Nếu task đang chọn có 0 câu → về "all"
+      if (examSet !== "all" && countForTask(examSet) === 0) {
+        examSet = CFG.defaultTask && countForTask(CFG.defaultTask) > 0 ? CFG.defaultTask : "all";
+      }
+      const cur = normalizeExamSet(examSet);
+      // Chỉ render tab có câu (giữ "all"); không hiện tab count = 0
+      const visibleTasks = TASK_DEFS.filter((t) => t.id === "all" || countForTask(t.id) > 0);
+      taskTabs.innerHTML = visibleTasks
+        .map((t) => {
+          const on = cur === t.id;
+          const n = countForTask(t.id);
+          return (
+            '<button type="button" class="tab exam-tab' +
+            (on ? " active" : "") +
+            '" data-exam="' +
+            t.id +
+            '" role="tab" aria-selected="' +
+            (on ? "true" : "false") +
+            '">' +
+            (t.icon ? '<i class="fa-solid ' + t.icon + '"></i> ' : "") +
+            '<span class="tab-text">' +
+            t.label +
+            "</span>" +
+            '<span class="tab-count" data-task-count="' +
+            t.id +
+            '">' +
+            n +
+            "</span></button>"
+          );
+        })
+        .join("");
+      taskTabs.querySelectorAll(".exam-tab").forEach((btn) => {
+        btn.addEventListener("click", () => setExamSet(btn.getAttribute("data-exam")));
+      });
+    }
+    const examBar = document.querySelector(".exam-bar");
+    if (examBar) {
+      const real = TASK_DEFS.filter((t) => t.id !== "all");
+      examBar.classList.toggle("hidden", real.length < 1 && TASK_DEFS.length <= 1);
+    }
+    updateExamBadges();
+  }
+  paintSubjectChrome();
+
+  // —— Boot ——
+  if (!BANK.length) {
+    el.questionText.textContent = "Không tải được câu hỏi. Kiểm tra data subject + file data/*.js.";
+    updateBadges();
+    return;
+  }
+
+  dbg("boot", {
+    totalQuestions: BANK.length,
+    examSet,
+    shuffleDefault: el.shuffleToggle?.checked,
+  });
+  applyExamUi();
+  syncReshuffleBtn();
+
+  bootStorage()
+    .then(() => {
+      // Cloud path already restored via onAfterLoad; local path still needs restore.
+      if (!(window.StudyCloud && StudyCloud.isCloud())) {
+        if (!pendingRestore) pendingRestore = loadProgressLocal();
+        restorePositionAndBuild();
+      } else if (!queue.length) {
+        // Safety: cloud mounted but queue empty (onAfterLoad missed)
+        restorePositionAndBuild();
+      }
+    })
+    .catch((e) => {
+      console.warn(e);
+      wrongIds = loadWrongIdsLocal();
+      pendingRestore = loadProgressLocal();
+      restorePositionAndBuild();
+    });
+})();
