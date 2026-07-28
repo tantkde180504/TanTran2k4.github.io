@@ -7,7 +7,7 @@
   "use strict";
 
   const CFG = global.STUDY_CLOUD || global.MLN_CLOUD || {};
-  const MASTER_CODE = String(CFG.MASTER_CODE || "Namcong9@");
+  const MASTER_CODE = String(CFG.MASTER_CODE || "TanTran@2004");
   const DATABASE_URL = String(CFG.DATABASE_URL || "");
   const FLAG_KEY = "study-cloud-mode-v1";
   const DEVICE_KEY = "study-cloud-device-id-v1";
